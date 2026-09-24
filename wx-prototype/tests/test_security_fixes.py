@@ -102,6 +102,92 @@ def test_production_warns_when_master_code_is_unset(monkeypatch):
     assert "WX_MASTER_CODE" in warnings
 
 
+# ------------------------------------------------------------ production fail-fast
+
+def test_production_boot_fails_when_master_code_is_unset(monkeypatch):
+    """WX_ENV=production with no WX_MASTER_CODE must refuse to start.
+
+    Not merely warn: a deploy that believes it has comp access but does not is a
+    configuration error, and the passcode is an entitlement source, so it fails
+    loudly at startup instead of coming up in a different shape than intended.
+    """
+    import config
+    import app as app_module
+    monkeypatch.setenv("WX_ENV", "production")
+    monkeypatch.setenv("WX_SECRET", "x" * 40)
+    monkeypatch.delenv("WX_MASTER_CODE", raising=False)
+    with pytest.raises(config.ConfigError) as err:
+        with TestClient(app_module.app):
+            pass
+    assert "WX_MASTER_CODE" in str(err.value)
+
+
+def test_production_boot_fails_when_master_code_is_blank(monkeypatch):
+    import config
+    import app as app_module
+    monkeypatch.setenv("WX_ENV", "production")
+    monkeypatch.setenv("WX_SECRET", "x" * 40)
+    monkeypatch.setenv("WX_MASTER_CODE", "   ")
+    with pytest.raises(config.ConfigError) as err:
+        with TestClient(app_module.app):
+            pass
+    assert "WX_MASTER_CODE" in str(err.value)
+
+
+def test_production_boot_fails_when_signing_secret_is_unset(monkeypatch):
+    import config
+    import app as app_module
+    monkeypatch.setenv("WX_ENV", "production")
+    monkeypatch.delenv("WX_SECRET", raising=False)
+    monkeypatch.setenv("WX_MASTER_CODE", "a-real-comp-code")
+    with pytest.raises(config.ConfigError) as err:
+        with TestClient(app_module.app):
+            pass
+    assert "WX_SECRET" in str(err.value)
+
+
+def test_production_boot_succeeds_with_both_secrets_set(monkeypatch):
+    import app as app_module
+    monkeypatch.setenv("WX_ENV", "production")
+    monkeypatch.setenv("WX_SECRET", "x" * 40)
+    monkeypatch.setenv("WX_MASTER_CODE", "a-real-comp-code")
+    with TestClient(app_module.app) as c:
+        assert c.get("/api/health").status_code == 200
+
+
+def test_development_boot_is_not_blocked_by_the_master_code(monkeypatch):
+    """Dev/staging keep the warning, never the fatal error."""
+    import config
+    import app as app_module
+    monkeypatch.delenv("WX_MASTER_CODE", raising=False)
+    monkeypatch.delenv("WX_ENV", raising=False)
+    assert config.assert_production_ready() is None
+    with TestClient(app_module.app) as c:
+        assert c.get("/api/health").status_code == 200
+
+
+def test_staging_does_not_fail_fast(monkeypatch):
+    import config
+    monkeypatch.setenv("WX_ENV", "staging")
+    monkeypatch.delenv("WX_MASTER_CODE", raising=False)
+    assert config.assert_production_ready() is None
+
+
+def test_assert_production_ready_is_a_noop_without_master_code_in_dev(monkeypatch):
+    import config
+    monkeypatch.setenv("WX_ENV", "dev")
+    monkeypatch.delenv("WX_MASTER_CODE", raising=False)
+    monkeypatch.delenv("WX_SECRET", raising=False)
+    assert config.assert_production_ready() is None
+
+
+def test_passcode_is_still_closed_when_master_code_is_empty(client, monkeypatch):
+    """Independent of the startup guard: empty must never match at request time."""
+    monkeypatch.setenv("WX_ENV", "production")
+    monkeypatch.setenv("WX_MASTER_CODE", "")
+    assert client.post("/api/auth/passcode", json={"code": ""}).status_code == 401
+
+
 def test_wx_secret_is_still_a_hard_failure_in_production(monkeypatch):
     """The master code is a soft guard; the signing key must stay a hard one."""
     import config

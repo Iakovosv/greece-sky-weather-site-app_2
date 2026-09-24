@@ -14,8 +14,9 @@ Environment
 WX_SECRET        signing key. MUST be set to a random value in production; the
                  default exists only so local development works.
 WX_MASTER_CODE   passcode that unlocks PRO for comps/testing. Required in
-                 production; when unset in production the passcode endpoint is
-                 disabled. The development fallback is never usable in prod.
+                 production: a missing or blank value fails startup, because the
+                 passcode is an entitlement source and there is deliberately no
+                 usable default. An empty value never matches at request time.
 """
 from __future__ import annotations
 

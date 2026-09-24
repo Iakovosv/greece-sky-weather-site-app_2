@@ -38,7 +38,7 @@ uvicorn app:app --host 0.0.0.0 --port 12000
 | `WX_RATE_LIMIT_DISABLED` | `1` απενεργοποιεί το rate limit (για tests/dev) |
 | `WX_STRIPE_SECRET_KEY` / `WX_STRIPE_PRICE_*` / `WX_PUBLIC_BASE_URL` | Stripe checkout |
 | `WX_STRIPE_WEBHOOK_SECRET` | Επαλήθευση webhook |
-| `WX_MASTER_CODE` | Master passcode για comps/tests. **Απαιτείται** στο production· αν λείπει, το passcode κλείνει |
+| `WX_MASTER_CODE` | Master passcode για comps/tests. **Απαιτείται** στο production: αν λείπει ή είναι κενό, η εκκίνηση αποτυγχάνει (δεν υπάρχει usable default) |
 
 Το `app.py` σερβίρει και το front-end. Χρειάζεται μόνο το `static/chart.umd.min.js`
 (vendored, σερβίρεται από allow-list route). Δεν φορτώνεται βιβλιοθήκη χάρτη: η

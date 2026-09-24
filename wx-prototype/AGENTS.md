@@ -45,6 +45,12 @@ adding infrastructure is an explicit non-goal.
   or the equivalent server check. `test_entitlements_api.py` guards this.
 - **Admin endpoints are closed when unconfigured.** `WX_ADMIN_TOKEN` unset means
   404/503, never an open admin surface.
+- **Production fails fast on entitlement secrets.** `config.assert_production_ready()`
+  (called from the startup hook) raises `ConfigError` when `WX_ENV=production` and
+  `WX_SECRET` or `WX_MASTER_CODE` is unset. Neither has a usable production
+  default. Do not move these checks to import time: the hook runs after
+  `envfile.load()`, so a value in `.env` is honoured. Staging/dev keep the warning
+  only, never the fatal error.
 - **Never log secrets**: no Stripe keys, card data, `WX_SECRET`,
   `WX_ADMIN_TOKEN`, raw tokens, or unnecessary personal data.
 - **Analytics keeps no directly identifying data**: no IP, no full User-Agent,

@@ -164,9 +164,10 @@ def master_code() -> str:
 
     Unlike `WX_SECRET`, there is deliberately no usable default in production: a
     literal compiled into the source and printed in the README would let anyone
-    mint a PRO token by copying it. Production must set the variable, and an
-    unset one disables the passcode endpoint entirely rather than falling back.
-    The development value below exists only so `pytest` and a laptop run work.
+    mint a PRO token by copying it. Production must set the variable;
+    `assert_production_ready()` refuses to start without it, and this returns ""
+    so the passcode endpoint can never match in the meantime. The development
+    value below exists only so `pytest` and a laptop run work.
     """
     value = _env("WX_MASTER_CODE")
     if value:
@@ -234,8 +235,9 @@ def validate_runtime() -> list[str]:
         else:
             problems.append("WX_SECRET is unset (using the development default)")
     if not _env("WX_MASTER_CODE") and is_production():
-        # Not fatal: the passcode endpoint is simply closed. Warned because a
-        # deploy that expected comp access will otherwise look broken.
+        # Non-fatal warning only outside production; in production
+        # `assert_production_ready()` raises on the same condition, so this line
+        # exists to name the problem in logs before that check runs.
         problems.append("WX_MASTER_CODE is unset: the passcode endpoint is disabled "
                         "in production (set it to enable comp/test access)")
     if not _env("WX_PUBLIC_BASE_URL") and _env("WX_STRIPE_SECRET_KEY"):
@@ -245,3 +247,33 @@ def validate_runtime() -> list[str]:
         problems.append("WX_STRIPE_WEBHOOK_SECRET is unset: subscriptions cannot be "
                         "activated through the webhook (the claim endpoint still works)")
     return problems
+
+
+def assert_production_ready() -> None:
+    """Fatal production preconditions. Raises `ConfigError` on the first failure.
+
+    Separate from `validate_runtime()` because the two have different contracts:
+    that one returns warnings for things that degrade a feature but let the
+    service come up, this one refuses to start. A misconfiguration that would
+    hand out PRO or allow forged tokens is not something to boot through.
+
+    Called once from the app's startup hook, which runs after `envfile.load()`,
+    so a value in `.env` is honoured. Outside production this is a no-op: the
+    development defaults exist precisely so a laptop and `pytest` work.
+
+    WX_MASTER_CODE is required in production for the same reason as WX_SECRET:
+    the passcode is an entitlement source. Leaving it unset does not merely
+    disable comp access, it also means the deploy silently differs from what the
+    operator believed was configured, so it fails loudly instead.
+    """
+    if not is_production():
+        return
+    if not _env("WX_SECRET"):
+        raise ConfigError(
+            "WX_SECRET must be set when WX_ENV=production. Generate one with: "
+            "python3 -c \"import secrets;print(secrets.token_urlsafe(48))\"")
+    if not _env("WX_MASTER_CODE"):
+        raise ConfigError(
+            "WX_MASTER_CODE must be set when WX_ENV=production: it is the passcode "
+            "that unlocks PRO. Set a random value, or unset WX_ENV if this is not "
+            "a production deployment. There is no usable default.")

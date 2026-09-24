@@ -227,6 +227,10 @@ async def _report_optional_deps():
              round(config.cache_max_bytes() / 1e6) if config.cache_max_bytes() else "none")
     for problem in config.validate_runtime():
         log.warning("configuration: %s", problem)
+    # Fatal preconditions last, so the warnings above are already in the log when
+    # this raises. In production a missing entitlement secret must stop the boot
+    # rather than quietly serving a different configuration than was intended.
+    config.assert_production_ready()
     try:
         promo.init_db()
     except Exception as e:
