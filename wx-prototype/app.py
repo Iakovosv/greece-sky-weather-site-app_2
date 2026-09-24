@@ -31,29 +31,32 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.requests import ClientDisconnect
 
-import analytics
-import astro
-import bias
-import billing as bill
-import cameras as cams
-import config
-import entitlements as ent
 import envfile
-import grids
-import legal
-import logging_setup
-import notify
-import promo
-import ratelimit
-import scheduler
-import verify as vfy
-import wx
 
-# Configuration comes from the environment. Load .env first, before any module
-# reads a setting, so a file-based setup behaves exactly like exported variables.
+# Loaded before the local imports on purpose: `wx`, `grids`, `scheduler`,
+# `billing` and `astro` resolve a setting at import time, so reading `.env`
+# afterwards left those seven values frozen at their development defaults and
+# made a file-configured deploy silently ignore the file.
 # Real environment variables win (override=False): a systemd unit or container
 # -e flag is a deployment decision, a stray .env in the cwd is not.
 envfile.load()
+
+import analytics  # noqa: E402 - must follow envfile.load() above
+import astro  # noqa: E402
+import bias  # noqa: E402
+import billing as bill  # noqa: E402
+import cameras as cams  # noqa: E402
+import config  # noqa: E402
+import entitlements as ent  # noqa: E402
+import grids  # noqa: E402
+import legal  # noqa: E402
+import logging_setup  # noqa: E402
+import notify  # noqa: E402
+import promo  # noqa: E402
+import ratelimit  # noqa: E402
+import scheduler  # noqa: E402
+import verify as vfy  # noqa: E402
+import wx  # noqa: E402
 
 # Logging is configured immediately after the environment is loaded, so the
 # level and format can come from `.env`, and so every import-time message from
