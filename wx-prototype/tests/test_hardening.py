@@ -210,14 +210,43 @@ def test_buckets_are_independent_per_client():
     assert lim.allow("b", limit)[0]
 
 
-def test_stale_buckets_are_swept_so_the_map_does_not_grow_forever():
-    lim = ratelimit.Limiter()
+def test_stale_buckets_are_swept_so_the_map_does_not_grow_forever(monkeypatch):
+    """The sweep is time-driven, so the test must own the clock.
+
+    `Limiter.__init__` seeds `_last_sweep` from the real `time.monotonic()`, and
+    `allow()` skips the sweep unless 600 s have passed since then. Passing a
+    literal `now` therefore only worked while the host's uptime happened to be
+    below that literal minus 600: on a machine up longer than ~2.6 h the seed
+    exceeded `10_000` and the sweep never ran, so the test failed for reasons
+    that had nothing to do with the code it guards. Freezing the clock the
+    production code actually reads makes the test depend on the elapsed-time
+    logic alone, not on the uptime of the machine running it.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(ratelimit.time, "monotonic", lambda: clock["t"])
+    lim = ratelimit.Limiter()            # seeds _last_sweep from the frozen clock
     limit = ratelimit.Limits(rate=1.0, burst=1)
-    lim.allow("old", limit, now=0.0)
+
+    lim.allow("old", limit)              # a real, non-empty bucket at t=0
     assert len(lim._buckets) == 1
-    # A later call triggers the sweep, and the untouched bucket is dropped.
-    lim.allow("new", limit, now=10_000.0)
+    # Idle for over an hour, then a call from another client: the sweep runs and
+    # drops only the untouched bucket.
+    clock["t"] = 3601.0
+    lim.allow("new", limit)
     assert all(k[0] != "old" for k in lim._buckets)
+    assert len(lim._buckets) == 1
+
+    # A bucket touched within the stale window survives a sweep that still runs.
+    clock["t"] = 4000.0                  # <600 s since the last sweep: no sweep
+    lim.allow("new", limit)
+    clock["t"] = 5000.0                  # >=600 s: sweep runs again
+    lim.allow("live", limit)
+    assert any(k[0] == "new" for k in lim._buckets), "recently-touched bucket was swept"
+
+    # Once every bucket is idle past the window, the next sweep clears them all.
+    clock["t"] = 9000.0
+    lim.allow("x", limit)
+    assert {k[0] for k in lim._buckets} == {"x"}
 
 
 def test_proxy_headers_are_only_trusted_when_configured(monkeypatch):
