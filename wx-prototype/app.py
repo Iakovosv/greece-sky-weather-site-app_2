@@ -1033,29 +1033,34 @@ button.primary:hover{filter:brightness(1.08)}
          appears for a visitor who actually has a subscription. -->
     <div class="manage" id="pm-manage" hidden></div>
 
+    <!-- Promo/gift window, shown only when the caller holds one. Filled from the
+         existing /api/promo/status; the device id it also returns is operator
+         data and is deliberately never rendered here. -->
+    <div class="manage" id="pm-promoline" hidden></div>
+
     <div class="codebox">
       <div class="row" style="justify-content:space-between">
-        <b style="font-size:13px">Έχετε κωδικό πρόσβασης;</b>
+        <b style="font-size:13px">Έχεις κωδικό PRO;</b>
       </div>
       <div class="row">
-        <input id="pm-code" placeholder="Κωδικός πρόσβασης" autocomplete="off"
-               onkeydown="if(event.key==='Enter')redeem()">
-        <button onclick="redeem()">Ενεργοποίηση</button>
-      </div>
-      <div class="msg" id="pm-code-msg"></div>
-    </div>
-
-    <!-- Gift / promo codes. A separate, quieter box from the passcode above:
-         the passcode is the operator's own key, while this is the thing you hand
-         to a friend. Both redeem server-side; neither sets a flag in the browser. -->
-    <details class="codebox" id="pm-promo-wrap">
-      <summary style="font-size:13px">Έχεις κωδικό PRO;</summary>
-      <div class="row">
-        <input id="pm-promo" placeholder="Γράψε τον κωδικό" autocomplete="off"
+        <input id="pm-promo" placeholder="Κωδικός PRO" autocomplete="off"
                onkeydown="if(event.key==='Enter')redeemPromo()">
         <button onclick="redeemPromo()">Εξαργύρωση</button>
       </div>
       <div class="msg" id="pm-promo-msg"></div>
+    </div>
+
+    <!-- Operator/admin passcode. Deliberately quieter and collapsed: this is the
+         operator's own key, not something a customer is expected to have, so it
+         must not be the field a gift-code holder reaches for first. -->
+    <details class="codebox" id="pm-admin-wrap">
+      <summary style="font-size:13px">Κωδικός διαχειριστή</summary>
+      <div class="row">
+        <input id="pm-code" placeholder="Κωδικός διαχειριστή" autocomplete="off"
+               onkeydown="if(event.key==='Enter')redeem()">
+        <button onclick="redeem()">Ενεργοποίηση</button>
+      </div>
+      <div class="msg" id="pm-code-msg"></div>
     </details>
 
     <div class="note2" id="pm-note"></div>
@@ -1133,13 +1138,13 @@ document.addEventListener('toggle',e=>{
   if(!el || !el.open || !el.id) return;
   if(el.id==='x-skewt') track('skewt_opened');
   else if(el.id==='x-models') track('model_comparison_opened');
-  else if(el.id==='pm-promo-wrap') track('promo_code_opened');
 },true);
 
 function openModal(){
   track('pro_paywall_viewed');
+  track('promo_code_opened');   // the PRO-code field is visible on every open now
   document.getElementById('promodal').classList.add('open');
-  document.getElementById('pm-promo-wrap').open=false;
+  document.getElementById('pm-admin-wrap').open=false;
   // A returning visitor can open the modal straight from the hero, before any
   // forecast has fetched /api/plans; fill it in rather than showing a blank card.
   if(PLANS){ fillPlans(); return; }
@@ -1189,8 +1194,10 @@ function renderCta(){
       +'<div class="go"><button class="primary" onclick="ctaGo()" id="cta-go">Ξεκίνα δωρεάν δοκιμή '
         +PLANS.trial_days+' ημερών</button>'
         +'<button onclick="openModal()">Δες όλα τα πλάνα</button></div>')
-    +'<div class="fineprint">Η ενεργοποίηση πληρωμής δεν είναι συνδεδεμένη σε αυτή την έκδοση. '
-      +'Η δωρεάν δοκιμή και η ενεργοποίηση με κωδικό λειτουργούν πραγματικά.</div>'
+    +'<div class="fineprint">'+(PLANS.checkout_available
+      ? 'Η πληρωμή γίνεται με ασφάλεια μέσω Stripe. Δεν βλέπουμε στοιχεία κάρτας.'
+      : 'Η πληρωμή δεν είναι διαθέσιμη αυτή τη στιγμή.')
+      +'</div>'
     +'</div>';
   SELECTED_PLAN='trial';
 }
@@ -1252,10 +1259,8 @@ function renderAutoRenewNote(){
       +'Η ενεργοποίηση με κωδικό λειτουργεί επίσης.';
     return;
   }
-  const missing=(PLANS && PLANS.checkout_missing) ? PLANS.checkout_missing.join(', ') : '';
-  el.textContent='Η πληρωμή δεν είναι ενεργοποιημένη σε αυτή την εγκατάσταση'
-    +(missing?(' (λείπει: '+missing+')'):'')+': το κουμπί δεν χρεώνει. '
-    +'Η ενεργοποίηση με κωδικό λειτουργεί πραγματικά.';
+  el.textContent='Η πληρωμή δεν είναι διαθέσιμη αυτή τη στιγμή.'
+    +' Η ενεργοποίηση με κωδικό λειτουργεί πραγματικά.';
 }
 function fillPlans(){
   const P=PLANS.pricing;
@@ -1282,7 +1287,7 @@ function fillPlans(){
   }else{
     cta.disabled=true; cta.title='Η πληρωμή δεν είναι ρυθμισμένη σε αυτή την εγκατάσταση.';
   }
-  renderAutoRenew(); renderAutoRenewNote(); loadSubscription();
+  renderAutoRenew(); renderAutoRenewNote(); loadSubscription(); loadPromoLine();
 }
 async function redeem(){
   const code=document.getElementById('pm-code').value.trim();
@@ -1321,6 +1326,7 @@ async function redeemPromo(){
     TOKEN=d.token; localStorage.setItem('wx_token',TOKEN);
     msg.className='msg ok';
     msg.textContent='Το PRO ενεργοποιήθηκε έως '+d.pro_until_iso+'.';
+    loadPromoLine();                              // show the window it just granted
     setTimeout(()=>{ closeModal(); if(CUR) reload(); },900);
   }catch(e){ msg.className='msg err'; msg.textContent='Σφάλμα: '+e.message; }
 }
@@ -1336,7 +1342,11 @@ async function checkout(){
                ...(TOKEN?{'X-WX-Token':TOKEN}:{})},
       body:JSON.stringify({plan:SELECTED_PLAN})});
     const d=await r.json();
-    if(!r.ok){ m.className='msg err'; m.textContent=d.detail||'Η πληρωμή δεν ξεκίνησε.'; return; }
+    // A 503 detail names the missing server settings; that is operator data, so
+    // the user gets a neutral line instead. Other errors are already user-facing.
+    if(!r.ok){ m.className='msg err';
+      m.textContent = r.status===503 ? 'Η πληρωμή δεν είναι διαθέσιμη αυτή τη στιγμή.'
+        : (d.detail||'Η πληρωμή δεν ξεκίνησε.'); return; }
     track('checkout_started',{meta:{plan:SELECTED_PLAN}});
     // Stripe's hosted page handles the card. Nothing card-related touches this app.
     location.href=d.url;
@@ -1380,6 +1390,22 @@ function fmtDate(ts){
   const d=new Date(ts*1000);
   return d.toLocaleDateString('el-GR',{day:'numeric',month:'long',year:'numeric'});
 }
+/* The promo/gift window this caller holds, if any. Read from the existing
+   /api/promo/status; only the human-readable end date is shown — the endpoint
+   also returns the caller's device id for an operator, and that never reaches
+   the page. A caller with no token has no device yet, so this is skipped. */
+async function loadPromoLine(){
+  const box=document.getElementById('pm-promoline'); if(!box) return;
+  if(!TOKEN){ box.hidden=true; return; }
+  try{
+    const r=await fetch('/api/promo/status',{headers:{'X-WX-Token':TOKEN}});
+    const d=await r.json();
+    if(!r.ok || !d.active){ box.hidden=true; return; }
+    box.hidden=false;
+    box.innerHTML='<div class="mrow"><span>Κωδικός PRO</span><b>ενεργό έως '
+      +esc(d.pro_until_iso||fmtDate(d.pro_until))+'</b></div>';
+  }catch(e){ box.hidden=true; }
+}
 function renderManage(){
   const box=document.getElementById('pm-manage'); if(!box||!SUB) return;
   box.hidden=false;
@@ -1418,7 +1444,15 @@ async function setAutoRenew(enabled){
 }
 
 function signOut(){
+  // The token is the only thing that grants PRO on this device, and a promo code
+  // cannot be redeemed twice, so this is not a reversible "log out". Say so
+  // plainly rather than letting a single click drop paid-for access.
+  const msg='Η αποσύνδεση αφαιρεί το PRO από αυτή τη συσκευή. '
+    +'Η συνδρομή σου ΔΕΝ ακυρώνεται, αλλά η επαναφορά της πρόσβασης μπορεί να '
+    +'χρειάζεται νέα ενεργοποίηση. Θέλεις να συνεχίσεις;';
+  if(!window.confirm(msg)) return;
   TOKEN=null; localStorage.removeItem('wx_token');
+  const pl=document.getElementById('pm-promoline'); if(pl) pl.hidden=true;
   TIER={tier:'free',is_pro:false,source:'free',
         free_hours:PLANS?PLANS.free_hours:72,
         pro_hours:PLANS?PLANS.pro_hours:240,
@@ -1440,7 +1474,10 @@ function renderTierBar(t, containerId){
           +PLANS_HOURS(t.locked_hours)+'.')
     +'</span>';
   if(!pro) el.innerHTML+='<button onclick="openModal()" style="margin-left:auto">Αναβάθμιση σε PRO</button>';
-  else el.innerHTML+='<button onclick="signOut()" style="margin-left:auto">Έξοδος από PRO</button>';
+  // A subscription token cannot be re-issued from the browser: the only way back
+  // is a fresh Checkout Session, so there is no sign-out button for it. Removing
+  // one's own PRO by accident must not be a single click away.
+  else if(t.source!=='subscription') el.innerHTML+='<button onclick="signOut()" style="margin-left:auto">Έξοδος από PRO</button>';
 }
 function PLANS_HOURS(hours){ return hours>=24 ? (hours/24)+' ημέρες ('+hours+' ώρες)' : hours+' ώρες'; }
 
@@ -2661,6 +2698,7 @@ async function claimCheckout(sessionId){
   }
   if(!TOKEN) return;
   await refreshTier();
+  loadPromoLine();          // a returning promo holder sees their window on load
   if(TIER.is_pro) renderCta();
 })();
 </script></body></html>"""
