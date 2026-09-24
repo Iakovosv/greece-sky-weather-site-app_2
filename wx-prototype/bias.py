@@ -112,7 +112,7 @@ def record_obs(station_id: str, ts_utc: str, temp_c: float | None, humidity: flo
                wind_kmh: float | None, gust_kmh: float | None, pressure: float | None,
                rain_mm: float | None) -> bool:
     """Store one observation. Returns False if it was rejected as implausible."""
-    if temp_c is not None and not (IMPLAUSIBLE_C[0] <= temp_c <= IMPLUSIBLE_C[1]):
+    if temp_c is not None and not (IMPLAUSIBLE_C[0] <= temp_c <= IMPLAUSIBLE_C[1]):
         return False
     with _db() as con:
         con.execute(
