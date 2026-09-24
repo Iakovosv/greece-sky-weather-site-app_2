@@ -58,6 +58,12 @@ STATION = Limits(rate=1.0, burst=30)
 # tight enough that the endpoint cannot be used to write rows without bound —
 # which is the one thing here an anonymous caller can grow.
 ANALYTICS = Limits(rate=0.5, burst=20)
+# Notification preference writes: a human toggles these. Tight, because each one
+# writes a row and the settings screen is small.
+NOTIFY_WRITE = Limits(rate=0.25, burst=6)
+# The test push actually hits Google/Apple/Mozilla and costs quota, so it is the
+# tightest limit in the app: a handful per day for a person, not a loop.
+NOTIFY_TEST = Limits(rate=1.0 / 120.0, burst=2)
 # Everything else, including the free astronomy card.
 DEFAULT = Limits(rate=2.0, burst=60)
 

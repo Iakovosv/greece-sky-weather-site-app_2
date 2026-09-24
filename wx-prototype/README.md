@@ -39,6 +39,11 @@ uvicorn app:app --host 0.0.0.0 --port 12000
 | `WX_STRIPE_SECRET_KEY` / `WX_STRIPE_PRICE_*` / `WX_PUBLIC_BASE_URL` | Stripe checkout |
 | `WX_STRIPE_WEBHOOK_SECRET` | Επαλήθευση webhook |
 | `WX_MASTER_CODE` | Master passcode για comps/tests. **Απαιτείται** στο production: αν λείπει ή είναι κενό, η εκκίνηση αποτυγχάνει (δεν υπάρχει usable default) |
+| `WX_VAPID_PUBLIC_KEY` / `WX_VAPID_PRIVATE_KEY` | Κλειδιά Web Push (ειδοποιήσεις). Και τα δύο base64url. Χωρίς αυτά τα `/api/push/*` απαντούν `503` |
+| `WX_VAPID_SUBJECT` | `mailto:` που στέλνεται στον πάροχο push (προεπ. `WX_CONTACT_EMAIL`) |
+| `WX_NOTIFY_INTERVAL_S` | Κάθε πόσο σαρώνει ο scheduler τα forecasts για ειδοποιήσεις (προεπ. `900`) |
+| `WX_NOTIFY_PRO_REFRESH_S` | Κάθε πόσο ξαναρωτά τη Stripe για συνδρομητές (προεπ. `21600`) |
+| `WX_NOTIFY_RETENTION_DAYS` | Ημέρες διατήρησης του ιστορικού ειδοποιήσεων (προεπ. `30`) |
 
 Το `app.py` σερβίρει και το front-end. Χρειάζεται μόνο το `static/chart.umd.min.js`
 (vendored, σερβίρεται από allow-list route). Δεν φορτώνεται βιβλιοθήκη χάρτη: η
@@ -64,6 +69,9 @@ uvicorn app:app --host 0.0.0.0 --port 12000
 | `envfile.py` | Φόρτωση `.env` (χωρίς εξάρτηση· δεν υπερισχύει του πραγματικού env) |
 | `legal.py` | Σελίδες Όρων, Απορρήτου και Επιστροφών· στοιχεία επικοινωνίας |
 | `bias.py` | Διόρθωση μεροληψίας με βάση τοπικό σταθμό· πίνακας `model_fcst` (ιστορικό runs) |
+| `notify.py` | Ειδοποιήσεις Web Push (PRO): συνδρομές συσκευής, κανόνες, dedupe, scheduler, VAPID |
+| `static/sw.js` | Service worker: λήψη push, εμφάνιση notification, άνοιγμα εφαρμογής στο κλικ |
+| `static/manifest.webmanifest` | PWA manifest (installable app, iOS web push) |
 
 ## Επαλήθευση έναντι ERA5
 
@@ -316,6 +324,73 @@ WX_YOUTUBE_URL=https://www.youtube.com/@YOUR_HANDLE
 WX_FACEBOOK_URL=https://www.facebook.com/YOUR_PAGE
 WX_EMAIL=support@yourdomain.gr
 ```
+
+## Ειδοποιήσεις Web Push (PRO)
+
+Οι ειδοποιήσεις είναι λειτουργία **PRO** και ελέγχονται στον server, όπως κάθε
+άλλη PRO λειτουργία: τα `/api/push/*` και `/api/notify/*` περνούν από
+`require_pro()` και επιστρέφουν `403` σε FREE χρήστες. Δεν υπάρχει flag στο
+frontend που να αποφασίζει ποιος είναι PRO.
+
+Το UI είναι **PWA**. Ο service worker (`static/sw.js`) σερβίρεται από τη ρίζα
+(`/sw.js`, με `Service-Worker-Allowed: /`), ώστε το scope του να καλύπτει όλη την
+εφαρμογή. Το `static/manifest.webmanifest` δηλώνει `display: standalone`, που
+είναι η προϋπόθεση για web push στο iOS — εκεί οι ειδοποιήσεις λειτουργούν
+**μόνο** αφού ο χρήστης προσθέσει την εφαρμογή στην οθόνη αφετηρίας, και η σελίδα
+εμφανίζει σχετική οδηγία.
+
+### Ρύθμιση
+
+```bash
+pip install "pywebpush>=2.0" "cryptography>=42"
+python -c "import notify; notify.print_vapid_keys()"
+# Αντίγραψε τις δύο γραμμές στο .env:
+#   WX_VAPID_PUBLIC_KEY=...
+#   WX_VAPID_PRIVATE_KEY=...
+```
+
+Χωρίς τα κλειδιά, τα `/api/push/*` απαντούν `503` και «Οι ειδοποιήσεις δεν είναι
+διαθέσιμες» — η υπόλοιπη εφαρμογή λειτουργεί κανονικά. Το ιδιωτικό κλειδί δεν
+γράφεται ποτέ σε log ούτε επιστρέφεται σε client· μόνο το δημόσιο στέλνεται στον
+browser μέσω `/api/push/config`.
+
+### Πώς συμπεριφέρεται
+
+- **Κανόνες.** Βροχή, άνεμος, καύσωνας/κρύο, καταιγίδα. Κάθε κανόνας έχει κατώφλι
+  `warn` και `severe` με χρονικό παράθυρο (προεπ. 24 h) και ελάχιστο χρόνο
+  προειδοποίησης (προεπ. 1 h).
+- **Ώρες ησυχίας.** Τα `warn` σιωπούν τη νύχτα· τα `severe` περνούν πάντα. Ο
+  έλεγχος γίνεται **πριν** την καταγραφή του event, ώστε μια ειδοποίηση που
+  σιώπησε να μπορεί αργότερα να σταλεί αν κλιμακωθεί.
+- **Dedupe (at-least-once).** Κάθε περιστατικό έχει κλειδί
+  `rule|ημερομηνία|παράθυρο|κύτταρο`. Μια εγγραφή `pending` ξαναδοκιμάζεται με
+  backoff μέχρι `retry_max`, μετά μένει `failed`. Το OS `tag` είναι το ίδιο
+  κλειδί, οπότε δεν στοιβάζονται δύο όψεις της ίδιας ειδοποίησης.
+- **Cooldown / όριο ημέρας.** Ένας κανόνας δεν επαναλαμβάνεται μέσα στο cooldown
+  του και υπάρχει ανώτατο όριο ειδοποιήσεων την ημέρα.
+- **Τοποθεσία ειδοποιήσεων.** Χωριστή από την τοποθεσία περιήγησης: το να δεις
+  πρόγνωση αλλού **δεν** αλλάζει πού στέλνονται οι ειδοποιήσεις. Αποθηκεύεται
+  χονδρικοποιημένη σε πλέγμα 0,1°.
+- **Απασχόληση Stripe.** Ο scheduler δεν ρωτά τη Stripe ανά σάρωση· ξαναελέγχει
+  ανά `WX_NOTIFY_PRO_REFRESH_S` (προεπ. 6 h) και, σε αποτυχία, **διατηρεί** την
+  προηγούμενη κατάσταση αντί να κόψει την πρόσβαση.
+
+### Endpoints
+
+| Endpoint | Ρόλος |
+|---|---|
+| `GET /api/push/config` | Δημόσιο VAPID key + αν το push είναι διαθέσιμο |
+| `POST /api/push/subscribe` | Αποθήκευση συνδρομής (PRO). Αν το token δεν έχει device id, ο server δίνει ένα και επιστρέφει νέο token |
+| `POST /api/push/unsubscribe` | Απενεργοποίηση (προαιρετικά διαγραφή δεδομένων) |
+| `GET /api/notify/state` | Τρέχουσα κατάσταση για το UI |
+| `POST /api/notify/location` | Αλλαγή τοποθεσίας ειδοποιήσεων |
+| `POST /api/notify/prefs` | Ενεργό/ανενεργό, κανόνες, ώρες ησυχίας |
+| `POST /api/notify/test` | Δοκιμαστική ειδοποίηση (για έλεγχο από τον χρήστη) |
+
+Όταν ένας χρήστης PRO έρχεται από passcode ή Stripe (token χωρίς device id), το
+πρώτο notify write του δίνει ένα device id και επιστρέφει νέο υπογεγραμμένο
+token· ο browser το αποθηκεύει. Έτσι η συνδρομή push αποκτά σταθερή ταυτότητα
+χωρίς να αλλάξει η ροή πληρωμής ή passcode.
 
 ## Σύγκριση μοντέλων και συμφωνία
 

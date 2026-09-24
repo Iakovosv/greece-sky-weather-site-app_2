@@ -277,3 +277,24 @@ def assert_production_ready() -> None:
             "WX_MASTER_CODE must be set when WX_ENV=production: it is the passcode "
             "that unlocks PRO. Set a random value, or unset WX_ENV if this is not "
             "a production deployment. There is no usable default.")
+
+
+# ---------------------------------------------------------------- push (VAPID)
+
+def vapid_public_key() -> str:
+    """The VAPID public key handed to the browser. Safe to serve."""
+    return _env("WX_VAPID_PUBLIC_KEY")
+
+
+def vapid_private_key() -> str:
+    """The VAPID private key. Never logged and never returned to a client.
+
+    Read from the environment only, like the Stripe secret: there is no file
+    fallback and no default, so a deploy that has not set it cannot accidentally
+    sign with a public value.
+    """
+    return _env("WX_VAPID_PRIVATE_KEY")
+
+
+def vapid_configured() -> bool:
+    return bool(vapid_public_key() and vapid_private_key())

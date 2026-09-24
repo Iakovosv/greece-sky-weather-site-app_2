@@ -20,3 +20,10 @@ gcsfs>=2024.6
 # Stripe payments (billing.py). Imported lazily: without it the forecast, the
 # passcode and the trial all work, and the payment button disables itself.
 stripe>=10.0
+# Web Push notifications (notify.py). Imported lazily, exactly like stripe:
+# without it the whole forecast works and the notifications section reports
+# itself unavailable (503 on /api/push/*) instead of failing at startup.
+# pywebpush and py_vapid are MPL-2.0 (file-level copyleft, fine for commercial
+# use); http-ece is MIT and cryptography is Apache-2.0 OR BSD-3-Clause.
+pywebpush>=2.0
+cryptography>=42

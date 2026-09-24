@@ -63,6 +63,10 @@ EVENTS = frozenset({
     "promo_code_redeemed",
     "sky_camera_opened",
     "verification_viewed",
+    "notify_enabled",
+    "notify_disabled",
+    "notify_location_set",
+    "notify_test_sent",
 })
 
 # Coarse cell size in degrees. 0.5° is ~55 km of latitude and, at Greek

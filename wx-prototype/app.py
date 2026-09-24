@@ -42,6 +42,7 @@ import envfile
 import grids
 import legal
 import logging_setup
+import notify
 import promo
 import ratelimit
 import scheduler
@@ -80,6 +81,11 @@ _LIMITS = {
     "/api/station/ecowitt": ratelimit.STATION,
     "/api/station/register": ratelimit.STATION,
     "/api/analytics": ratelimit.ANALYTICS,
+    "/api/notify/test": ratelimit.NOTIFY_TEST,
+    "/api/push/subscribe": ratelimit.NOTIFY_WRITE,
+    "/api/push/unsubscribe": ratelimit.NOTIFY_WRITE,
+    "/api/notify/location": ratelimit.NOTIFY_WRITE,
+    "/api/notify/prefs": ratelimit.NOTIFY_WRITE,
 }
 # Paths that must never be throttled: a rate-limited health check reports the
 # service as down, and the legal pages are read by Stripe's crawler.
@@ -259,13 +265,96 @@ async def _report_optional_deps():
     _ram_task = scheduler.start(grids.STORE)
     if _ram_task is not None:
         log.info("RAM grids ενεργά (WX_USE_RAM_GRIDS): ο scheduler ξεκίνησε στο background.")
+    global _notify_task
+    _notify_task = notify.start(prime=_notify_prime)
+    if _notify_task is not None:
+        log.info("Οι ειδοποιήσεις είναι ενεργές: ο loop ξεκίνησε στο background.")
+    elif notify.interval_s() > 0:
+        log.info("Οι ειδοποιήσεις είναι ανενεργές (λείπει: %s).",
+                 notify.unavailable_reason() or "disabled")
 
 
 _ram_task: asyncio.Task | None = None
+_notify_task: asyncio.Task | None = None
+
+
+async def _notify_prime(subs: list[dict]) -> dict:
+    """Build one hourly series per distinct cell for the whole batch.
+
+    This is the shared-read point: ten subscribers in Ilioupoli cost one set of
+    model reads, not ten. It uses the RAM grids when they are loaded and falls
+    back to the same per-point path the forecast uses otherwise, so notifications
+    work with `WX_USE_RAM_GRIDS` off as well.
+    """
+    out: dict = {}
+    for sub in subs:
+        key = notify.cell_label(sub.get("cell_lat"), sub.get("cell_lon"))
+        if key is None or key in out:
+            continue
+        try:
+            rows = await _notify_series(sub["cell_lat"], sub["cell_lon"])
+        except Exception as e:
+            log.warning("notify: series for cell %s failed: %s: %s",
+                        key, type(e).__name__, e)
+            rows = None
+        out[key] = rows
+    return out
+
+
+def _normalize_hours(rows: list[dict]) -> list[dict]:
+    """Shapes either source's rows into what `notify.evaluate` reads.
+
+    Both the RAM grid rows and the per-point rows carry `t2m_c` in Kelvin while
+    `evaluate` works in Celsius, so the conversion happens once here rather than
+    in the rule code. `feels` is computed with the same `apparent_temp` the UI
+    uses, so an alert and the forecast cannot disagree about the number.
+    """
+    out = []
+    for r in rows:
+        step = r.get("step", r.get("step_h"))
+        if step is None:
+            continue
+        raw_t = r.get("t2m_c")
+        t = None if raw_t is None else raw_t - 273.15
+        wind = r.get("wind_kmh")
+        rh = r.get("rh2_pct")
+        out.append({
+            "step_h": int(step),
+            "t": t,
+            "rh": rh,
+            "precip": r.get("precip_mm"),
+            "wind": wind,
+            "gust": r.get("gust_kmh"),
+            "cape": r.get("cape"),
+            "feels": apparent_temp(t, rh, wind) if t is not None else None,
+        })
+    return out
+
+
+async def _notify_series(lat: float, lon: float) -> list[dict] | None:
+    """Hourly series for one cell, shaped for `notify.evaluate`.
+
+    Prefers the in-memory grids (no network, no GRIB decode) when the flag is on
+    and the point is covered; otherwise falls back to `wx.gfs_surface_series`,
+    which is cached and works continent-wide. CAPE is attached only where the
+    model provides it, because the storm rule must not be run on a guess.
+    """
+    hours = 24
+    ram = grids.STORE.get("gfs") if grids.flag_enabled() else None
+    if ram is not None and not grids.covers(ram, lat, lon):
+        ram = None
+    if ram is not None:
+        steps = [s for s in wx.gfs_steps(hours) if ram.step_index(s) is not None]
+        if steps:
+            return _normalize_hours(grids.surface_rows(ram, lat, lon, steps))
+    rows = await wx.gfs_surface_series(lat, lon, hours=hours)
+    return _normalize_hours(rows)
 
 
 @app.on_event("shutdown")
 async def _stop_ram_scheduler():
+    if _notify_task is not None and not _notify_task.done():
+        _notify_task.cancel()
     if _ram_task is not None and not _ram_task.done():
         _ram_task.cancel()
 
@@ -274,6 +363,12 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PAGE = r"""<!doctype html><html lang="el"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Greece Sky and Weather</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#070b14">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Greece Sky">
 <script src="/static/chart.umd.min.js"></script>
 <style>
 /* Dark glass, iOS-style. --card is translucent on purpose: the blur in
@@ -1038,6 +1133,19 @@ button.primary:hover{filter:brightness(1.08)}
          data and is deliberately never rendered here. -->
     <div class="manage" id="pm-promoline" hidden></div>
 
+    <!-- Notifications (PRO). Kept compact on purpose: a badge, the notification
+         area, and the alert types. The browser/OS permission state and the
+         app-level on/off state are shown as two separate things, because they
+         fail independently and only the browser knows the first. -->
+    <div class="manage" id="pm-notify" hidden>
+      <div class="mrow">
+        <b>🔔 Ειδοποιήσεις</b>
+        <span id="pm-notify-badge" class="mlabel">—</span>
+      </div>
+      <div id="pm-notify-body"></div>
+      <div class="msg" id="pm-notify-msg"></div>
+    </div>
+
     <div class="codebox">
       <div class="row" style="justify-content:space-between">
         <b style="font-size:13px">Έχεις κωδικό PRO;</b>
@@ -1288,6 +1396,7 @@ function fillPlans(){
     cta.disabled=true; cta.title='Η πληρωμή δεν είναι ρυθμισμένη σε αυτή την εγκατάσταση.';
   }
   renderAutoRenew(); renderAutoRenewNote(); loadSubscription(); loadPromoLine();
+  renderNotify();
 }
 async function redeem(){
   const code=document.getElementById('pm-code').value.trim();
@@ -1327,6 +1436,7 @@ async function redeemPromo(){
     msg.className='msg ok';
     msg.textContent='Το PRO ενεργοποιήθηκε έως '+d.pro_until_iso+'.';
     loadPromoLine();                              // show the window it just granted
+    renderNotify();                               // notifications just became available
     setTimeout(()=>{ closeModal(); if(CUR) reload(); },900);
   }catch(e){ msg.className='msg err'; msg.textContent='Σφάλμα: '+e.message; }
 }
@@ -1406,6 +1516,277 @@ async function loadPromoLine(){
       +esc(d.pro_until_iso||fmtDate(d.pro_until))+'</b></div>';
   }catch(e){ box.hidden=true; }
 }
+
+/* ---------- notifications (PRO) ----------
+   The server owns eligibility and delivery. This layer only (a) asks the browser
+   for permission and a subscription, (b) hands that subscription and the chosen
+   notification area to the server, and (c) renders what /api/notify/state says.
+   It never decides who is PRO and never contains a PRO feature by itself. */
+let NOTIFY=null;                 // last /api/notify/state payload
+let NOTIFY_CFG=null;             // /api/push/config
+const NOTIFY_LABELS={rain:'Βροχή',storm:'Καταιγίδα',wind:'Άνεμος',temp:'Θερμοκρασία'};
+
+function isIOS(){
+  return /iP(hone|ad|od)/.test(navigator.platform) ||
+    (navigator.userAgent.includes('Mac') && 'ontouchend' in document);
+}
+function isStandalone(){
+  return window.navigator.standalone===true ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+}
+function notifySupported(){
+  return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+}
+
+async function loadNotifyConfig(){
+  if(NOTIFY_CFG) return NOTIFY_CFG;
+  try{ NOTIFY_CFG=await (await fetch('/api/push/config')).json(); }catch(e){ NOTIFY_CFG=null; }
+  return NOTIFY_CFG;
+}
+
+async function renderNotify(){
+  const box=document.getElementById('pm-notify'); if(!box) return;
+  if(!TIER.is_pro){ box.hidden=true; return; }        // FREE sees nothing here
+  box.hidden=false;
+  const badge=document.getElementById('pm-notify-badge');
+  const body=document.getElementById('pm-notify-body');
+
+  const cfg=await loadNotifyConfig();
+  if(!cfg || !cfg.available){
+    badge.textContent='—';
+    body.innerHTML='<div class="mlabel" style="margin-top:8px">Οι ειδοποιήσεις δεν είναι '
+      +'διαθέσιμες αυτή τη στιγμή.</div>';
+    return;
+  }
+  try{
+    NOTIFY=await (await fetch('/api/notify/state',
+      {headers:TOKEN?{'X-WX-Token':TOKEN}:{}})).json();
+  }catch(e){ NOTIFY=null; }
+  if(!NOTIFY){ badge.textContent='—'; body.innerHTML=''; return; }
+  paintNotify();
+}
+
+function paintNotify(){
+  const badge=document.getElementById('pm-notify-badge');
+  const body=document.getElementById('pm-notify-body');
+  const n=NOTIFY||{};
+  const perm=('Notification' in window)?Notification.permission:'default';
+
+  // Two independent states, shown as two independent lines. "Blocked in the
+  // browser" is not the same as "off in the app", and the user can only fix the
+  // first one in their browser settings.
+  if(!n.subscribed){
+    badge.textContent='Ανενεργές';
+    badge.style.color='var(--dim)';
+    let h='';
+    if(isIOS() && !isStandalone()){
+      h+='<div class="mlabel" style="margin-top:8px">Στο iPhone οι ειδοποιήσεις '
+        +'λειτουργούν μόνο όταν η εφαρμογή είναι στην οθόνη αφετηρίας. Πάτησε '
+        +'«Κοινή χρήση» → «Προσθήκη στην οθόνη αφετηρίας» και άνοιξέ την από εκεί.</div>';
+    }else if(!notifySupported()){
+      h+='<div class="mlabel" style="margin-top:8px">Ο browser δεν υποστηρίζει ειδοποιήσεις.</div>';
+    }else{
+      h+='<div class="mlabel" style="margin-top:8px">Δεν έχει οριστεί περιοχή ειδοποιήσεων.</div>'
+        +'<button onclick="notifyEnable()">📍 Χρησιμοποίηση της τρέχουσας τοποθεσίας μου</button>'
+        +'<button onclick="notifyAskSearch()">Αναζήτηση περιοχής</button>';
+    }
+    h+='<div id="pm-notify-search"></div>';
+    body.innerHTML=h;
+    return;
+  }
+
+  // Subscribed: badge reflects the app-level switch, not the permission.
+  badge.textContent = n.active?'Ενεργές':'Ανενεργές';
+  badge.style.color = n.active?'var(--good)':'var(--dim)';
+  let h='';
+  if(perm==='denied'){
+    h+='<div class="mlabel" style="margin-top:8px">Ο browser έχει μπλοκάρει τις '
+      +'ειδοποιήσεις. Άνοιξέ τις από τις ρυθμίσεις του site.</div>';
+  }
+  const place=n.place_name?esc(n.place_name)+(n.place_admin1?' — '+esc(n.place_admin1):'')
+    :'<span style="color:var(--bad)">δεν έχει οριστεί</span>';
+  h+='<div class="mrow" style="margin-top:8px"><span class="mlabel">Περιοχή ειδοποιήσεων</span></div>'
+    +'<div class="mrow"><b>📍 '+place+'</b></div>'
+    +'<button onclick="notifyAskSearch()">Αλλαγή περιοχής</button>';
+
+  if(n.rules){
+    h+='<div class="mrow" style="margin-top:10px"><span class="mlabel">Τύποι ειδοποιήσεων</span></div>';
+    for(const k of ['rain','storm','wind','temp']){
+      const on=n.rules[k]?'checked':'';
+      h+='<label class="mtoggle"><input type="checkbox" '+on+' onchange="notifyToggle(\''+k+'\',this.checked)">'
+        +'<span class="mlabel">'+NOTIFY_LABELS[k]+'</span></label>';
+    }
+  }
+  h+='<div class="mrow" style="margin-top:8px">'
+    +'<button onclick="notifyToggleActive('+(n.active?'false':'true')+')">'
+    +(n.active?'Απενεργοποίηση':'Ενεργοποίηση')+'</button>'
+    +'<button onclick="notifyTest()">Δοκιμαστική ειδοποίηση</button></div>'
+    +'<div id="pm-notify-search"></div>';
+  body.innerHTML=h;
+}
+
+function notifyMsg(text, ok){
+  const m=document.getElementById('pm-notify-msg'); if(!m) return;
+  m.className='msg '+(ok?'ok':'err'); m.textContent=text;
+}
+
+/* Ask for permission, get one fix, reverse-geocode it, and register it. The
+   coordinates are read exactly once, on this click; there is no watcher. */
+async function notifyEnable(){
+  if(!notifySupported()){ notifyMsg('Ο browser δεν υποστηρίζει ειδοποιήσεις.'); return; }
+  if(isIOS() && !isStandalone()){
+    notifyMsg('Στο iPhone χρειάζεται πρώτα «Προσθήκη στην οθόνη αφετηρίας».'); return;
+  }
+  try{
+    const perm=await Notification.requestPermission();
+    if(perm!=='granted'){ notifyMsg('Ο browser δεν έδωσε άδεια. Μπορείς να ορίσεις περιοχή χειροκίνητα.',false); return; }
+  }catch(e){ notifyMsg('Σφάλμα άδειας: '+e.message,false); return; }
+
+  notifyMsg('Λήψη τοποθεσίας…');
+  let loc=null;
+  if(navigator.geolocation){
+    loc=await new Promise(res=>{
+      navigator.geolocation.getCurrentPosition(
+        p=>res({lat:p.coords.latitude,lon:p.coords.longitude}),
+        ()=>res(null),{enableHighAccuracy:false,timeout:10000,maximumAge:600000});
+    });
+  }
+  if(!loc){
+    notifyMsg('Δεν πήραμε τοποθεσία. Αναζήτησε την περιοχή χειροκίνητα.',false);
+    notifyAskSearch();
+    return;
+  }
+  // Reverse geocode for a human label. A failure here is fine: the cell is what
+  // actually drives the alerts, the label is only for display.
+  let name=null, admin1=null;
+  try{
+    const r=await (await fetch('/api/reverse?lat='+loc.lat+'&lon='+loc.lon)).json();
+    name=r.name||null; admin1=r.admin1||r.state||null;
+  }catch(e){}
+  await notifyRegister(loc.lat,loc.lon,name,admin1);
+}
+
+async function notifyRegister(lat,lon,name,admin1){
+  try{
+    notifyMsg('Ενεργοποίηση…');
+    const reg=await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    const cfg=await loadNotifyConfig();
+    if(!cfg||!cfg.vapid_public_key){ notifyMsg('Οι ειδοποιήσεις δεν είναι ρυθμισμένες.',false); return; }
+    let sub=await reg.pushManager.getSubscription();
+    if(!sub){
+      sub=await reg.pushManager.subscribe({
+        userVisibleOnly:true,
+        applicationServerKey:urlBase64ToUint8Array(cfg.vapid_public_key)});
+    }
+    const payload={subscription:sub.toJSON(),ios_standalone:isStandalone(),
+                   location:{lat:lat,lon:lon,name:name,admin1:admin1}};
+    const r=await fetch('/api/push/subscribe',{method:'POST',
+      headers:{'Content-Type':'application/json',...(TOKEN?{'X-WX-Token':TOKEN}:{})},
+      body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(!r.ok){ notifyMsg(d.detail||'Η ενεργοποίηση απέτυχε.',false); return; }
+    // A passcode/subscription token carries no device id. The server mints one on
+    // the first notify write and returns a re-signed token carrying it; without
+    // storing that here the very next write would mint a different id and the
+    // freshly created subscription would look like it belonged to someone else.
+    if(d.token){ TOKEN=d.token; localStorage.setItem('wx_token',TOKEN); }
+    track('notify_enabled');
+    notifyMsg('Οι ειδοποιήσεις ενεργοποιήθηκαν.',true);
+    await renderNotify();
+  }catch(e){ notifyMsg('Σφάλμα: '+e.message,false); }
+}
+
+function notifyAskSearch(){
+  const box=document.getElementById('pm-notify-search'); if(!box) return;
+  box.innerHTML='<div class="row" style="margin-top:8px">'
+    +'<input id="pm-notify-q" placeholder="Πόλη ή χωριό" autocomplete="off"'
+    +' onkeydown="if(event.key===\'Enter\')notifySearch()">'
+    +'<button onclick="notifySearch()">Αναζήτηση</button></div>';
+  const q=document.getElementById('pm-notify-q'); if(q) q.focus();
+}
+
+async function notifySearch(){
+  const q=document.getElementById('pm-notify-q');
+  if(!q) return;
+  const s=q.value.trim(); if(!s) return;
+  try{
+    const r=await (await fetch('/api/resolve?q='+encodeURIComponent(s)+'&lat=39.0&lon=22.0')).json();
+    if(!r.length){ notifyMsg('Δεν βρέθηκε τοποθεσία.',false); return; }
+    const g=r.find(x=>x.countrycode==='GR')||r[0];
+    await notifySetLocation(g.latitude,g.longitude,
+      g.name+(g.admin1?' — '+g.admin1:''),g.admin1||null);
+  }catch(e){ notifyMsg('Σφάλμα αναζήτησης: '+e.message,false); }
+}
+
+async function notifySetLocation(lat,lon,name,admin1){
+  try{
+    const r=await fetch('/api/notify/location',{method:'POST',
+      headers:{'Content-Type':'application/json',...(TOKEN?{'X-WX-Token':TOKEN}:{})},
+      body:JSON.stringify({lat:lat,lon:lon,name:name,admin1:admin1})});
+    const d=await r.json();
+    if(!r.ok){ notifyMsg(d.detail||'Η αλλαγή περιοχής απέτυχε.',false); return; }
+    track('notify_location_set');
+    notifyMsg('Η περιοχή ειδοποιήσεων ενημερώθηκε.',true);
+    await renderNotify();
+  }catch(e){ notifyMsg('Σφάλμα: '+e.message,false); }
+}
+
+async function notifyToggle(rule,on){
+  const rules=Object.assign({},(NOTIFY&&NOTIFY.rules)||{});
+  rules[rule]=on?1:0;
+  try{
+    const r=await fetch('/api/notify/prefs',{method:'POST',
+      headers:{'Content-Type':'application/json','X-WX-Token':TOKEN},
+      body:JSON.stringify({rules:rules})});
+    const d=await r.json();
+    if(!r.ok){ notifyMsg(d.detail||'Η αποθήκευση απέτυχε.',false); return; }
+    NOTIFY.rules=d.rules; notifyMsg('Αποθηκεύτηκε.',true);
+  }catch(e){ notifyMsg('Σφάλμα: '+e.message,false); }
+}
+
+async function notifyToggleActive(active){
+  try{
+    const r=await fetch('/api/notify/prefs',{method:'POST',
+      headers:{'Content-Type':'application/json','X-WX-Token':TOKEN},
+      body:JSON.stringify({active:active})});
+    const d=await r.json();
+    if(!r.ok){ notifyMsg(d.detail||'Η αποθήκευση απέτυχε.',false); return; }
+    track(active?'notify_enabled':'notify_disabled');
+    notifyMsg(active?'Ενεργοποιήθηκαν.':'Απενεργοποιήθηκαν.',true);
+    await renderNotify();
+  }catch(e){ notifyMsg('Σφάλμα: '+e.message,false); }
+}
+
+async function notifyTest(){
+  notifyMsg('Αποστολή…');
+  try{
+    const r=await fetch('/api/notify/test',{method:'POST',
+      headers:{'X-WX-Token':TOKEN}});
+    const d=await r.json();
+    if(!r.ok){ notifyMsg(d.detail||'Η αποστολή απέτυχε.',false); return; }
+    track('notify_test_sent');
+    notifyMsg('Στάλθηκε. Δες τις ειδοποιήσεις της συσκευής.',true);
+  }catch(e){ notifyMsg('Σφάλμα: '+e.message,false); }
+}
+
+function urlBase64ToUint8Array(base64){
+  const pad='='.repeat((4-base64.length%4)%4);
+  const b64=(base64+pad).replace(/-/g,'+').replace(/_/g,'/');
+  const raw=atob(b64); const out=new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) out[i]=raw.charCodeAt(i);
+  return out;
+}
+
+/* A browser can rotate a subscription on its own. The worker tells us; we simply
+   re-register with the server using the identity we already hold. */
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.addEventListener('message',ev=>{
+    if(ev.data && ev.data.type==='pushsubscriptionchange' && TOKEN) notifyRenderSafe();
+  });
+}
+function notifyRenderSafe(){ if(TIER.is_pro) renderNotify(); }
+
 function renderManage(){
   const box=document.getElementById('pm-manage'); if(!box||!SUB) return;
   box.hidden=false;
@@ -1453,6 +1834,7 @@ function signOut(){
   if(!window.confirm(msg)) return;
   TOKEN=null; localStorage.removeItem('wx_token');
   const pl=document.getElementById('pm-promoline'); if(pl) pl.hidden=true;
+  const pn=document.getElementById('pm-notify'); if(pn) pn.hidden=true;
   TIER={tier:'free',is_pro:false,source:'free',
         free_hours:PLANS?PLANS.free_hours:72,
         pro_hours:PLANS?PLANS.pro_hours:240,
@@ -2699,6 +3081,7 @@ async function claimCheckout(sessionId){
   if(!TOKEN) return;
   await refreshTier();
   loadPromoLine();          // a returning promo holder sees their window on load
+  notifyRenderSafe();       // and a returning PRO holder sees their alert settings
   if(TIER.is_pro) renderCta();
 })();
 </script></body></html>"""
@@ -3481,6 +3864,13 @@ async def health():
         # tile provider to license. The geocoder and DEM are still third-party
         # free services and remain the open commercial item.
         "base_map": None,
+        # Notifications: `configured` is whether VAPID keys and the push package
+        # are present. `subscribers` counts stored subscriptions, so an operator
+        # can tell "no subscribers yet" from "the loop is not running".
+        "push": {"configured": notify.push_available(),
+                 "reason": notify.unavailable_reason(),
+                 "interval_s": notify.interval_s(),
+                 "subscribers": notify.stats()},
     }
 
 
@@ -3569,6 +3959,32 @@ async def licenses_page() -> str:
             f"<p><a href='/'>&larr; Πίσω στην πρόγνωση</a></p><pre>{esc}</pre></body></html>")
 
 
+@app.get("/sw.js")
+async def service_worker() -> Response:
+    """The push service worker, at the root so its scope covers the whole site.
+
+    Served from a route rather than `/static/` because a worker's scope is capped
+    at its own directory: `/static/sw.js` would only control `/static/*`. The
+    `Service-Worker-Allowed` header is belt-and-braces for proxies that rewrite
+    the path. `no-cache` so a worker update is picked up on the next load.
+    """
+    p = os.path.join(STATIC_DIR, "sw.js")
+    if not os.path.exists(p):
+        raise HTTPException(404, "sw.js not vendored")
+    return Response(open(p, "rb").read(), media_type="application/javascript",
+                    headers={"Cache-Control": "no-cache",
+                             "Service-Worker-Allowed": "/"})
+
+
+@app.get("/manifest.webmanifest")
+async def manifest() -> Response:
+    """The web app manifest. Required for iOS web push to be offered at all."""
+    p = os.path.join(STATIC_DIR, "manifest.webmanifest")
+    if not os.path.exists(p):
+        raise HTTPException(404, "manifest not vendored")
+    return Response(open(p, "rb").read(), media_type="application/manifest+json")
+
+
 @app.get("/static/{name}")
 async def static_file(name: str) -> Response:
     """Serve the vendored front-end assets.
@@ -3576,7 +3992,13 @@ async def static_file(name: str) -> Response:
     Only an allow-list, by basename: a path parameter that reaches the filesystem
     needs this so that `../` cannot walk out of static/.
     """
-    allowed = {"chart.umd.min.js": "application/javascript"}
+    allowed = {"chart.umd.min.js": "application/javascript",
+               "sw.js": "application/javascript",
+               "manifest.webmanifest": "application/manifest+json",
+               "icon-192.png": "image/png",
+               "icon-512.png": "image/png",
+               "icon-maskable-512.png": "image/png",
+               "apple-touch-icon.png": "image/png"}
     media = allowed.get(name)
     if media is None:
         raise HTTPException(404, "not found")
@@ -4671,6 +5093,224 @@ async def admin_promo_set_active(code: str, request: Request):
 async def admin_analytics(request: Request, days: int = Query(30, ge=1, le=365)):
     require_admin(request)
     return analytics.summary(days=days)
+
+
+# ---------------------------------------------------------------- notifications (PRO)
+
+def _notify_enabled_or_503() -> None:
+    if not notify.push_available():
+        # Same shape as the billing 503: neutral message, no env names.
+        raise HTTPException(503, "Οι ειδοποιήσεις δεν είναι διαθέσιμες αυτή τη στιγμή.")
+
+
+def _notify_device(request: Request, response: Response,
+                   e: ent.Entitlement) -> tuple[str, str | None]:
+    """The caller's device id, minting one if their token predates it.
+
+    Passcode and Stripe tokens carry no device id, so a legitimate PRO holder
+    arriving from those flows has no identity for a subscription to key on. The
+    first notify write mints one, exactly as the promo path does, and hands back
+    a re-signed token carrying it. Returns (device, new_token_or_None).
+    """
+    if e.device:
+        return e.device, None
+    device = secrets.token_hex(16)
+    token = ent.issue_token(e.tier or "pro", e.source or "passcode",
+                            device=device, subscription_id=e.subscription_id)
+    with_device(response, device)
+    return device, token
+
+
+@app.get("/api/push/config")
+async def push_config():
+    """Whether push can work here, and the public key the browser needs.
+
+    The private key is never part of this response and never leaves the server.
+    """
+    available = notify.push_available()
+    return {"available": available,
+            "reason": notify.unavailable_reason(),
+            "vapid_public_key": notify.vapid_public_key() if available else None}
+
+
+@app.get("/api/notify/state")
+async def notify_state(request: Request):
+    """The app's view of this caller's notification settings.
+
+    Deliberately separate from the browser's own `Notification.permission`: the UI
+    must be able to show "blocked in the browser" and "off in the app" as two
+    different states, and only the browser knows the first.
+    """
+    e = effective_entitlement(request)
+    sub = notify.get_subscription(e.device) if e.device else None
+    return {
+        "eligible": bool(e.is_pro),
+        "tier": e.tier,
+        "source": e.source,
+        "available": notify.push_available(),
+        "reason": notify.unavailable_reason(),
+        "subscribed": bool(sub),
+        "active": bool(sub and sub.get("active")),
+        "has_location": bool(sub and sub.get("has_location")),
+        "place_name": sub.get("place_name") if sub else None,
+        "place_admin1": sub.get("place_admin1") if sub else None,
+        "rules": sub.get("rules") if sub else None,
+        "quiet_from": sub.get("quiet_from") if sub else None,
+        "quiet_to": sub.get("quiet_to") if sub else None,
+        "ios_standalone": bool(sub and sub.get("ios_standalone")),
+    }
+
+
+@app.post("/api/notify/location")
+async def notify_location(request: Request, response: Response, payload: dict):
+    """Set or change the notification location.
+
+    Only this endpoint changes it. Viewing a forecast for another place never
+    touches it, which is the whole point of keeping the notification area apart
+    from the browsing one. The exact point is quantized before storage.
+    """
+    _notify_enabled_or_503()
+    e = require_pro(request)
+    device, _ = _notify_device(request, response, e)
+    sub = notify.get_subscription(device)
+    if not sub:
+        raise HTTPException(409, "Ενεργοποίησε πρώτα τις ειδοποιήσεις.")
+    try:
+        lat = float(payload.get("lat"))
+        lon = float(payload.get("lon"))
+    except (TypeError, ValueError):
+        raise HTTPException(422, "Το lat και το lon πρέπει να είναι αριθμοί.")
+    err = config.coord_error(lat, lon)
+    if err:
+        raise HTTPException(422, err)
+    name = payload.get("name")
+    admin1 = payload.get("admin1")
+    updated = notify.set_location(
+        device,
+        place_name=name[:80] if isinstance(name, str) else None,
+        place_admin1=admin1[:80] if isinstance(admin1, str) else None,
+        lat=lat, lon=lon)
+    if updated is None:
+        raise HTTPException(404, "Δεν βρέθηκε η συνδρομή.")
+    analytics.track("notify_location_set", request=request, device=device, lat=lat, lon=lon)
+    return {"ok": True, "place_name": updated.get("place_name"),
+            "place_admin1": updated.get("place_admin1"),
+            "cell": notify.cell_label(updated.get("cell_lat"), updated.get("cell_lon"))}
+
+
+@app.post("/api/notify/prefs")
+async def notify_prefs(request: Request, response: Response, payload: dict):
+    """Enable/disable the app-level subscription and choose alert types."""
+    _notify_enabled_or_503()
+    e = require_pro(request)
+    device, _ = _notify_device(request, response, e)
+    sub = notify.get_subscription(device)
+    if not sub:
+        raise HTTPException(409, "Ενεργοποίησε πρώτα τις ειδοποιήσεις.")
+    if "active" in payload:
+        notify.set_active(device, bool(payload.get("active")))
+    if isinstance(payload.get("rules"), dict) or "quiet_from" in payload or "quiet_to" in payload:
+        qf = payload.get("quiet_from")
+        qt = payload.get("quiet_to")
+        for v, label in ((qf, "quiet_from"), (qt, "quiet_to")):
+            if v is not None and not (isinstance(v, int) and 0 <= v <= 23):
+                raise HTTPException(422, f"Το {label} πρέπει να είναι ώρα 0-23.")
+        notify.set_rules(device,
+                         payload.get("rules") if isinstance(payload.get("rules"), dict) else {},
+                         quiet_from=qf if isinstance(qf, int) else None,
+                         quiet_to=qt if isinstance(qt, int) else None)
+    sub = notify.get_subscription(device)
+    return {"ok": True, "subscribed": True, "active": bool(sub.get("active")),
+            "rules": sub.get("rules")}
+
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(request: Request, response: Response, payload: dict):
+    """Store this device's push subscription. PRO only, like every PRO surface."""
+    _notify_enabled_or_503()
+    e = require_pro(request)
+    device, new_token = _notify_device(request, response, e)
+
+    subinfo = payload.get("subscription") if isinstance(payload.get("subscription"), dict) else payload
+    endpoint = subinfo.get("endpoint")
+    keys = subinfo.get("keys") if isinstance(subinfo.get("keys"), dict) else {}
+    p256dh = keys.get("p256dh")
+    auth = keys.get("auth")
+    if not (isinstance(endpoint, str) and endpoint.startswith("https://")
+            and isinstance(p256dh, str) and isinstance(auth, str)):
+        raise HTTPException(422, "Μη έγκυρη συνδρομή push.")
+
+    ua_class, browser = analytics.describe_ua(request.headers.get("user-agent"))
+    loc = payload.get("location") if isinstance(payload.get("location"), dict) else None
+    cell = None
+    place_name = place_admin1 = None
+    if loc:
+        try:
+            lat, lon = float(loc.get("lat")), float(loc.get("lon"))
+            if not config.coord_error(lat, lon):
+                cell = notify.quantize(lat, lon)
+                place_name = loc.get("name")[:80] if isinstance(loc.get("name"), str) else None
+                place_admin1 = loc.get("admin1")[:80] if isinstance(loc.get("admin1"), str) else None
+        except (TypeError, ValueError):
+            cell = None
+
+    notify.upsert_subscription(
+        device, endpoint, p256dh, auth,
+        ua_class=ua_class, browser=browser,
+        ios_standalone=bool(payload.get("ios_standalone")),
+        place_name=place_name, place_admin1=place_admin1, cell=cell,
+        rules=payload.get("rules"),
+        quiet_from=payload.get("quiet_from") if isinstance(payload.get("quiet_from"), int) else None,
+        quiet_to=payload.get("quiet_to") if isinstance(payload.get("quiet_to"), int) else None,
+        pro_until=int(e.pro_until or e.expires_at or 0) or None,
+        subscription_id=e.subscription_id)
+    analytics.track("notify_enabled", request=request, device=device,
+                    lat=cell[0] if cell else None, lon=cell[1] if cell else None)
+    out = {"ok": True, "subscribed": True}
+    if new_token:
+        out["token"] = new_token
+    return out
+
+
+@app.post("/api/push/unsubscribe")
+async def push_unsubscribe(request: Request, payload: dict | None = None):
+    """Deactivate the app-level subscription. Optionally erase the stored data.
+
+    A purge is offered because the privacy policy promises removal on request;
+    the default only flips `active`, which keeps the dedupe history intact.
+    """
+    e = effective_entitlement(request)
+    if not e.device:
+        return {"ok": True, "unsubscribed": False}
+    purge = bool((payload or {}).get("purge"))
+    if purge:
+        notify.purge(e.device)
+        analytics.track("notify_disabled", request=request, device=e.device,
+                        meta={"purge": True})
+        return {"ok": True, "unsubscribed": True, "purged": True}
+    changed = notify.set_active(e.device, False)
+    analytics.track("notify_disabled", request=request, device=e.device)
+    return {"ok": True, "unsubscribed": changed}
+
+
+@app.post("/api/notify/test")
+async def notify_test(request: Request):
+    """Send one real notification to this device. PRO only; tightly rate-limited."""
+    _notify_enabled_or_503()
+    e = require_pro(request)
+    sub = notify.get_subscription(e.device) if e.device else None
+    if not sub or not sub.get("active"):
+        raise HTTPException(409, "Ενεργοποίησε πρώτα τις ειδοποιήσεις.")
+    alert = notify.Alert(
+        rule="test", severity="warn", lead_h=0, bucket=0, value=0.0, window_h=0,
+        title="🔔 Δοκιμαστική ειδοποίηση",
+        body="Οι ειδοποιήσεις λειτουργούν σε αυτή τη συσκευή.",
+        cell=notify.cell_label(sub.get("cell_lat"), sub.get("cell_lon")))
+    ok, err = notify.send_push(sub, alert)
+    if not ok:
+        log.warning("notify: test push failed for %s: %s", str(e.device)[:12], err)
+        raise HTTPException(502, "Η αποστολή δοκιμαστικής ειδοποίησης απέτυχε.")
+    return {"ok": True, "sent": True}
 
 
 # ---------------------------------------------------------------- analytics ingest
