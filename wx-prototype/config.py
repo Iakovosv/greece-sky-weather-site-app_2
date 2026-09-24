@@ -60,6 +60,24 @@ HOURS_MIN, HOURS_MAX = 1, 240
 DEFAULT_CACHE_MAX_MB = 2048
 CACHE_TTL_S = 3 * 3600
 
+# Request body ceiling. Every POST here carries a small JSON/form payload: a
+# promo code, a Stripe session id, one analytics batch, one Ecowitt reading. 1 MB
+# is far above any legitimate one and far below what would let an anonymous
+# caller force a large allocation or a slow parse per request.
+DEFAULT_MAX_BODY_MB = 1
+
+
+def max_body_bytes() -> int:
+    """Hard ceiling for an incoming request body, in bytes. 0 disables the cap."""
+    raw = _env("WX_MAX_BODY_MB")
+    try:
+        mb = int(raw)
+    except (TypeError, ValueError):
+        mb = DEFAULT_MAX_BODY_MB
+    if mb <= 0:
+        return 0
+    return mb * 1024 * 1024
+
 
 def finite_lat(value: float) -> bool:
     """True when `value` is a real latitude. NaN and infinity are not."""
@@ -142,7 +160,24 @@ DEV_SECRET = "dev-only-insecure-secret-change-me"
 
 
 def master_code() -> str:
-    return _env("WX_MASTER_CODE") or "GSW-PRO-2026"
+    """The comp/test passcode that unlocks PRO, or "" when there is none.
+
+    Unlike `WX_SECRET`, there is deliberately no usable default in production: a
+    literal compiled into the source and printed in the README would let anyone
+    mint a PRO token by copying it. Production must set the variable, and an
+    unset one disables the passcode endpoint entirely rather than falling back.
+    The development value below exists only so `pytest` and a laptop run work.
+    """
+    value = _env("WX_MASTER_CODE")
+    if value:
+        return value
+    if is_production():
+        return ""
+    return DEV_MASTER_CODE
+
+
+# Development-only fallback. `master_code()` refuses to return it in production.
+DEV_MASTER_CODE = "GSW-DEV-ONLY-CODE"
 
 
 def env_name(fallback: str = "dev") -> str:
@@ -198,6 +233,11 @@ def validate_runtime() -> list[str]:
             problems.append("WX_SECRET is unset")
         else:
             problems.append("WX_SECRET is unset (using the development default)")
+    if not _env("WX_MASTER_CODE") and is_production():
+        # Not fatal: the passcode endpoint is simply closed. Warned because a
+        # deploy that expected comp access will otherwise look broken.
+        problems.append("WX_MASTER_CODE is unset: the passcode endpoint is disabled "
+                        "in production (set it to enable comp/test access)")
     if not _env("WX_PUBLIC_BASE_URL") and _env("WX_STRIPE_SECRET_KEY"):
         problems.append("WX_PUBLIC_BASE_URL is unset while Stripe is configured; "
                         "checkout redirects will not work")

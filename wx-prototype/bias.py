@@ -131,10 +131,28 @@ def register_station(station_id: str, passkey: str | None, name: str | None,
 
 
 def get_station(station_id: str) -> dict | None:
+    """Full station row, including the passkey. Internal callers only.
+
+    Anything that reaches an HTTP response must go through `public_station()`
+    instead, or the device credential will be served to an anonymous caller.
+    """
     with _db() as con:
         row = con.execute("SELECT * FROM stations WHERE station_id=? AND active=1",
                           (station_id,)).fetchone()
     return dict(row) if row else None
+
+
+# The fields safe to return over an unauthenticated response. `passkey` is the
+# device credential and is deliberately absent: it authenticates the Ecowitt
+# push, so publishing it would let anyone post fabricated observations.
+PUBLIC_STATION_FIELDS = ("station_id", "name", "lat", "lon", "elevation_m", "active")
+
+
+def public_station(station: dict | None) -> dict | None:
+    """A station row reduced to its non-secret fields, or None."""
+    if not station:
+        return None
+    return {k: station.get(k) for k in PUBLIC_STATION_FIELDS}
 
 
 # ---------------------------------------------------------------- correction

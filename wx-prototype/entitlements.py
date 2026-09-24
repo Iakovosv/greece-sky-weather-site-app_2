@@ -13,7 +13,9 @@ Environment
 -----------
 WX_SECRET        signing key. MUST be set to a random value in production; the
                  default exists only so local development works.
-WX_MASTER_CODE   passcode that unlocks PRO for testing (default GSW-PRO-2026).
+WX_MASTER_CODE   passcode that unlocks PRO for comps/testing. Required in
+                 production; when unset in production the passcode endpoint is
+                 disabled. The development fallback is never usable in prod.
 """
 from __future__ import annotations
 
@@ -156,8 +158,14 @@ def check_passcode(code: str) -> str | None:
     """Return a PRO token if the master passcode matches, else None.
 
     Constant-time comparison so the endpoint does not leak the code by timing.
+    An unset master code (the production default) disables the endpoint: an
+    empty string must never match, which is why this is checked before the
+    comparison rather than relying on `hmac.compare_digest("", "")`.
     """
-    if code and hmac.compare_digest(code.encode(), master_code().encode()):
+    master = master_code()
+    if not master:
+        return None
+    if code and hmac.compare_digest(code.encode(), master.encode()):
         return issue_token("pro", "passcode")
     return None
 

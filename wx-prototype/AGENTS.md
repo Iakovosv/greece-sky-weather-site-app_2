@@ -47,8 +47,11 @@ adding infrastructure is an explicit non-goal.
   404/503, never an open admin surface.
 - **Never log secrets**: no Stripe keys, card data, `WX_SECRET`,
   `WX_ADMIN_TOKEN`, raw tokens, or unnecessary personal data.
-- **Analytics stays anonymous**: no IP, no full User-Agent, no exact
-  coordinates (a ~0.5° cell only), device id hashed with an installation salt.
+- **Analytics keeps no directly identifying data**: no IP, no full User-Agent,
+  no exact coordinates (a ~0.5° cell only). The device id *is* stored, but only
+  as a hash salted with a per-installation secret kept in the database, so it is
+  not reversible and not correlatable outside this database. The privacy page
+  describes this correctly; do not describe it as "anonymous".
 - **The analytics table stays bounded.** Raw events are the one table an
   anonymous caller can grow, so `POST /api/analytics` is rate-limited (not on
   the exempt list) and `analytics.maybe_prune()` deletes rows past

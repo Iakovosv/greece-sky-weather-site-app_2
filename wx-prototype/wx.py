@@ -40,6 +40,14 @@ PHOTON = "https://photon.komoot.io/api/"
 CACHE_DIR = os.environ.get("WX_CACHE_DIR", "/tmp/wx-cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# Memoization for the "which GFS cycle is published" probe. Five minutes is well
+# inside the six-hour publication cadence, so it can never name a stale run.
+RUN_LOOKUP_TTL_S = float(os.environ.get("WX_RUN_LOOKUP_TTL_S") or 300)
+# {model: (monotonic_at_store, (date, hh))}. Plain dict, guarded by the GIL for
+# the read/write of a single key; the probe itself is idempotent, so a rare
+# double-probe after a cache expiry is harmless.
+_run_lookup_cache: dict[str, tuple[float, tuple[str, str]]] = {}
+
 
 # ---------------------------------------------------------------- request guards
 #
@@ -126,8 +134,29 @@ async def nomads_get(client: httpx.AsyncClient, params: list) -> bytes:
 # ---------------------------------------------------------------- GFS (public domain)
 
 def latest_gfs_run(now: dt.datetime | None = None) -> tuple[str, str]:
-    """Most recent GFS cycle that is actually published (runs lag ~3.5-5 h)."""
-    now = now or dt.datetime.now(dt.timezone.utc)
+    """Most recent GFS cycle that is actually published (runs lag ~3.5-5 h).
+
+    Memoized for `RUN_LOOKUP_TTL_S`. The probe is up to eight outbound requests,
+    and it sits behind `/api/health`, which is deliberately exempt from the rate
+    limiter so monitoring can poll it. Without this cache, a monitoring loop (or
+    an attacker) polling health would hammer NOMADS and risk the 403 burst-block
+    that takes the forecast down with it. A GFS cycle is published every six
+    hours, so a few minutes of staleness cannot change the answer.
+
+    `now` is an explicit override for tests and internal callers; it bypasses the
+    cache, because a caller that names a time wants that time's answer.
+    """
+    if now is None:
+        cached = _run_lookup_cache.get("gfs")
+        if cached is not None and (time.monotonic() - cached[0]) < RUN_LOOKUP_TTL_S:
+            return cached[1]
+        resolved = _probe_latest_gfs_run(dt.datetime.now(dt.timezone.utc))
+        _run_lookup_cache["gfs"] = (time.monotonic(), resolved)
+        return resolved
+    return _probe_latest_gfs_run(now)
+
+
+def _probe_latest_gfs_run(now: dt.datetime) -> tuple[str, str]:
     cycle = (now - dt.timedelta(hours=4, minutes=30)).replace(minute=0, second=0, microsecond=0)
     cycle = cycle.replace(hour=(cycle.hour // 6) * 6)
     with httpx.Client(headers=UA, timeout=20) as c:

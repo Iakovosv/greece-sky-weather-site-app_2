@@ -29,6 +29,7 @@ import numpy as np
 import xarray as xr
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.requests import ClientDisconnect
 
 import analytics
 import astro
@@ -88,12 +89,17 @@ _LIMIT_EXEMPT = ("/api/health", "/terms", "/privacy", "/refunds", "/licenses",
 
 @app.middleware("http")
 async def _rate_limit(request: Request, call_next):
-    """Token-bucket throttle, and the security headers, in one pass.
+    """Body-size ceiling, token-bucket throttle, and the security headers.
 
     Ordering note: the limiter runs before the route, so an abusive request never
     reaches a handler that would do a network fetch. That is the point of putting
-    it here rather than inside each handler.
+    it here rather than inside each handler. The body check runs first of all, so
+    an oversized payload is refused before any parsing or throttling work.
     """
+    too_large = _declared_body_too_large(request)
+    if too_large is not None:
+        return _with_security_headers(too_large)
+
     path = request.url.path
     limit = _LIMITS.get(path)
     if config.rate_limit_enabled() and limit is not None and _is_throttled_endpoint(path):
@@ -106,8 +112,88 @@ async def _rate_limit(request: Request, call_next):
                 {"detail": "Πολλά αιτήματα σε σύντομο χρόνο. Δοκίμασε ξανά σε λίγο.",
                  "retry_after": wait},
                 status_code=429, headers={"Retry-After": str(wait)})
-    response = await call_next(request)
-    return _with_security_headers(response)
+
+    # Only a body that does not declare its size needs the streaming guard; one
+    # with a `Content-Length` was already fully checked above.
+    if request.headers.get("content-length") is None:
+        overflow = _install_body_counter(request)
+        try:
+            response = await call_next(request)
+        except ClientDisconnect:
+            # Raised while the handler read a body that the counter cut off. That
+            # only happens once the cap was passed, so it is the oversized case,
+            # not a real client disconnect.
+            if overflow["exceeded"]:
+                log.warning("request body too large (streamed): path=%s cap=%s",
+                            path, overflow["cap"])
+                return _with_security_headers(JSONResponse(
+                    {"detail": "Το αίτημα είναι πολύ μεγάλο."}, status_code=413))
+            raise
+        if overflow["exceeded"]:
+            log.warning("request body too large (streamed): path=%s cap=%s",
+                        path, overflow["cap"])
+            return _with_security_headers(JSONResponse(
+                {"detail": "Το αίτημα είναι πολύ μεγάλο."}, status_code=413))
+        return _with_security_headers(response)
+
+    return _with_security_headers(await call_next(request))
+
+
+def _declared_body_too_large(request: Request) -> JSONResponse | None:
+    """413/400 when a declared `Content-Length` is over the cap or malformed.
+
+    Only the cheap, up-front case: a body that announces its size can be refused
+    before a single byte is read. A body with no `Content-Length` (chunked) is
+    covered by `_install_body_counter`. GET/HEAD/OPTIONS carry no body.
+    """
+    cap = config.max_body_bytes()
+    if cap <= 0 or request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    declared = request.headers.get("content-length")
+    if declared is None:
+        return None
+    try:
+        size = int(declared)
+    except ValueError:
+        return JSONResponse({"detail": "Μη έγκυρο Content-Length."}, status_code=400)
+    if size > cap:
+        log.warning("request body too large: path=%s declared=%s cap=%s",
+                    request.url.path, declared, cap)
+        return JSONResponse({"detail": "Το αίτημα είναι πολύ μεγάλο."}, status_code=413)
+    return None
+
+
+def _install_body_counter(request: Request) -> dict:
+    """Wrap the ASGI receive channel so a body without `Content-Length` is capped.
+
+    A chunked request is not trusted to be small: the wrapper counts the bytes
+    actually delivered to the handler and, once the cap is passed, ends the stream
+    (`http.disconnect`) so the server stops reading instead of buffering without
+    bound. The middleware turns the `exceeded` flag into a 413 afterwards. This
+    request object is the same one handed to `call_next`, so the wrapper is in
+    force for the handler's body read.
+
+    Returns a mutable record the caller inspects once the response is produced.
+    """
+    record = {"exceeded": False, "cap": config.max_body_bytes()}
+    cap = record["cap"]
+    if cap <= 0 or request.method in ("GET", "HEAD", "OPTIONS"):
+        return record
+    original_receive = request._receive
+    seen = 0
+
+    async def _counting_receive():
+        nonlocal seen
+        message = await original_receive()
+        if message.get("type") == "http.request":
+            seen += len(message.get("body", b""))
+            if seen > cap:
+                record["exceeded"] = True
+                return {"type": "http.disconnect"}
+        return message
+
+    request._receive = _counting_receive
+    return record
 
 
 def _is_throttled_endpoint(path: str) -> bool:
@@ -948,7 +1034,7 @@ button.primary:hover{filter:brightness(1.08)}
         <b style="font-size:13px">Έχετε κωδικό πρόσβασης;</b>
       </div>
       <div class="row">
-        <input id="pm-code" placeholder="π.χ. GSW-PRO-2026" autocomplete="off"
+        <input id="pm-code" placeholder="Κωδικός πρόσβασης" autocomplete="off"
                onkeydown="if(event.key==='Enter')redeem()">
         <button onclick="redeem()">Ενεργοποίηση</button>
       </div>
@@ -2070,7 +2156,7 @@ function renderExpert(d){
     h+=xsec('x-models','Σύγκριση 3 μοντέλων','PRO',
       lockedBlock('models','Η σύγκριση 3 μοντέλων είναι διαθέσιμη στο PRO',
         'GFS 0.25°, ICON-EU 7 km και ECMWF IFS δίπλα-δίπλα, με τη μεταξύ τους απόκλιση '
-        +'ως δείκτη αξιοπιστίας.'));
+        +'ως ένδειξη συμφωνίας των μοντέλων.'));
     h+=xsec('x-levels','Κατακόρυφη δομή','PRO',
       lockedBlock('levels','Η κατακόρυφη δομή είναι διαθέσιμη στο PRO',
         'Πίεση, ύψος, θερμοκρασία, σημείο δρόσου, σχετική υγρασία και άνεμος για κάθε '
@@ -2136,7 +2222,7 @@ function expertBody(d){
     +'</p>');
 
   if(e.agreement){
-    h+='<div class="verdict"><h3>Αξιοπιστία πρόγνωσης</h3>'
+    h+='<div class="verdict"><h3>Συμφωνία μοντέλων</h3>'
       +'<div class="bar '+(e.agreement.available?e.agreement.class:'unknown')+'"><i></i></div>'
       +'<p><span class="badge '+(e.agreement.available?e.agreement.class:'')+'">'
       +e.agreement.text+'</span> '+(e.agreement.detail||'')+'</p>'
@@ -3652,7 +3738,8 @@ async def _build_brief(request: Request, lat: float, lon: float, station: str | 
     if station:
         st = bias.get_station(station)
         if st:
-            station_info = st
+            # Public payload field: strip the passkey (see public_station).
+            station_info = bias.public_station(st)
             bias_info = bias.compute_bias(station, st["lat"] or lat, st["lon"] or lon, "gfs")
             gfs_rows = bias.apply_correction(gfs_rows, bias_info)
         else:
@@ -4320,11 +4407,36 @@ async def ecowitt_ingest(request: Request):
 
 @app.post("/api/station/register")
 async def register_station(payload: dict):
+    """Register or update a station. Validated here so bad input is a 422.
+
+    A missing key used to be a KeyError and a non-numeric `lat` a ValueError,
+    both of which surfaced as HTTP 500 from an unhandled exception - a public
+    endpoint reporting a server fault for what is a client mistake.
+    """
+    station_id = payload.get("station_id")
+    if not isinstance(station_id, str) or not (1 <= len(station_id) <= 64):
+        raise HTTPException(422, "station_id is required (1-64 characters)")
+    try:
+        lat = float(payload["lat"])
+        lon = float(payload["lon"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(422, "lat and lon are required and must be numbers")
+    if config.coord_error(lat, lon):
+        raise HTTPException(422, config.coord_error(lat, lon))
+    elevation_m = payload.get("elevation_m")
+    if elevation_m is not None:
+        try:
+            elevation_m = float(elevation_m)
+        except (TypeError, ValueError):
+            raise HTTPException(422, "elevation_m must be a number")
+        if not (-500 <= elevation_m <= 9000):
+            raise HTTPException(422, "elevation_m is out of range")
+    passkey = payload.get("passkey")
+    name = payload.get("name")
     bias.init_db()
-    bias.register_station(
-        station_id=payload["station_id"], passkey=payload.get("passkey"),
-        name=payload.get("name"), lat=float(payload["lat"]), lon=float(payload["lon"]),
-        elevation_m=payload.get("elevation_m"))
+    bias.register_station(station_id=station_id, passkey=passkey,
+                          name=name if isinstance(name, str) else None,
+                          lat=lat, lon=lon, elevation_m=elevation_m)
     return {"registered": True}
 
 
@@ -4335,7 +4447,9 @@ async def station_status(station_id: str):
         raise HTTPException(404, "not registered")
     obs = bias.recent_obs(station_id, 12)
     b = bias.compute_bias(station_id, st["lat"], st["lon"], "gfs")
-    return {"station": st, "recent_obs": obs, "bias": b}
+    # Public response: the passkey authenticates the Ecowitt push, so it must
+    # never leave the server. `public_station` is the single choke point.
+    return {"station": bias.public_station(st), "recent_obs": obs, "bias": b}
 
 
 bias.init_db()

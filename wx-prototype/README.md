@@ -31,16 +31,19 @@ uvicorn app:app --host 0.0.0.0 --port 12000
 | `WX_ANALYTICS` | `0` απενεργοποιεί εντελώς την καταγραφή |
 | `WX_ANALYTICS_RETENTION_DAYS` | Πόσες ημέρες κρατούνται τα events (προεπ. `365`, `0` = χωρίς όριο) |
 | `WX_CACHE_DIR` / `WX_CACHE_MAX_MB` | Θέση και όριο του cache |
+| `WX_MAX_BODY_MB` | Όριο μεγέθους σώματος αιτήματος σε MB (προεπ. `1`, `0` = χωρίς όριο) |
+| `WX_RUN_LOOKUP_TTL_S` | Δευτερόλεπτα που θυμάται ο εντοπισμός του τρέχοντος κύκλου GFS (προεπ. `300`) |
 | `WX_DB` | SQLite: σταθμοί, promo codes, redemptions, analytics |
 | `WX_TRUST_PROXY` | `1` όταν υπάρχει reverse proxy με `X-Forwarded-For` |
 | `WX_RATE_LIMIT_DISABLED` | `1` απενεργοποιεί το rate limit (για tests/dev) |
 | `WX_STRIPE_SECRET_KEY` / `WX_STRIPE_PRICE_*` / `WX_PUBLIC_BASE_URL` | Stripe checkout |
 | `WX_STRIPE_WEBHOOK_SECRET` | Επαλήθευση webhook |
-| `WX_MASTER_CODE` | Master passcode (άλλαξέ το από την προεπιλογή) |
+| `WX_MASTER_CODE` | Master passcode για comps/tests. **Απαιτείται** στο production· αν λείπει, το passcode κλείνει |
 
-Το `app.py` σερβίρει και το front-end. Χρειάζεται τα `static/leaflet.js`,
-`static/leaflet.css` και `static/chart.umd.min.js` (vendored, σερβίρονται από
-allow-list route).
+Το `app.py` σερβίρει και το front-end. Χρειάζεται μόνο το `static/chart.umd.min.js`
+(vendored, σερβίρεται από allow-list route). Δεν φορτώνεται βιβλιοθήκη χάρτη: η
+θέση επιλέγεται με αναζήτηση κειμένου, geolocation ή χειροκίνητες συντεταγμένες,
+οπότε δεν υπάρχει tile provider να αδειοδοτηθεί.
 
 ## Δομή
 
@@ -394,27 +397,12 @@ pip install -r requirements.txt   # ή: pip install "ephem>=4.1"
 
 ## Σημείωση για τα πλακίδια χάρτη
 
-Ο προεπιλεγμένος tile server είναι του OpenStreetMap, που **δεν** επιτρέπεται για
-εμπορική χρήση. Οι διαθέσιμες εμπορικά συμβατές επιλογές δεν είναι ισοδύναμες:
+**Δεν χρησιμοποιούνται πλακίδια χάρτη.** Το UI δεν φορτώνει βιβλιοθήκη χάρτη και
+δεν ζητά raster tiles, οπότε δεν υπάρχει πάροχος πλακιδίων προς αδειοδότηση. Η
+θέση επιλέγεται με αναζήτηση κειμένου (Photon), geolocation, αποθηκευμένα
+αγαπημένα ή χειροκίνητες συντεταγμένες.
 
-| Πάροχος | Εμπορική στο free | Key | Σημείωση |
-|---|---|---|---|
-| **CARTO** | ✅ | ✅ απαιτείται | 5M πλακίδια/μήνα· raster, δουλεύει με Leaflet as-is |
-| **Stadia Maps** | ❌ | — | free tier ρητά non-commercial· από $20/μήνα |
-| **Protomaps hosted** | ⚠️ | ✅ | δωρεάν μόνο non-commercial (GitHub Sponsors για εμπορική) |
-| **OpenFreeMap** | ✅ | ❌ | vector-only, χρειάζεται MapLibre· χωρίς SLA |
-| **Self-hosted** | ✅ | ❌ | κανένας τρίτος όρος |
-
-Προτεινόμενη ρύθμιση (CARTO, δωρεάν key από https://carto.com/basemaps/apikey):
-
-```bash
-WX_TILE_URL=https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png?api_key=YOUR_KEY
-WX_TILE_ATTRIB=&copy; <a href="https://carto.com/attributions">CARTO</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors
-WX_TILE_SUBDOMAINS=abcd
-WX_TILE_COMMERCIAL_OK=1
-```
-
-Το `WX_TILE_SUBDOMAINS` είναι απαραίτητο για URLs με `{s}`: χωρίς αυτό το Leaflet
-ζητά literal host `{s}` και κάθε πλακίδιο επιστρέφει 404. Το `WX_TILE_COMMERCIAL_OK=1`
-δηλώνει ότι ο πάροχος επιτρέπει εμπορική χρήση· όσο δεν ορίζεται, το UI εμφανίζει
-ορατή προειδοποίηση μέσα στον χάρτη. Λεπτομέρειες στο `LICENSES.md`, αποκλεισμός #2.
+Οι μεταβλητές `WX_TILE_*` έχουν **αφαιρεθεί**: δεν διαβάζονταν από κανένα σημείο
+του κώδικα και η τεκμηρίωσή τους δημιουργούσε την εντύπωση λειτουργίας που δεν
+υπάρχει. Το ιστορικό της απόφασης και οι εναλλακτικοί πάροχοι (αν ποτέ
+προστεθεί χάρτης) παραμένουν στο `LICENSES.md`.
