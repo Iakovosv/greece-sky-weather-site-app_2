@@ -100,25 +100,67 @@ Zarr ανά ώρα. Το ERA5 έχει υστέρηση ~5 ημερών, γι' �
 
 ## Ζωντανές κάμερες
 
-Οι κάμερες ρυθμίζονται με μεταβλητή περιβάλλοντος και **δεν** έχουν
-προεπιλεγμένα URLs. Η σύντομη μορφή αρκεί:
+Οι κάμερες έχουν **δύο ξεχωριστά επίπεδα**: τα δημόσια στοιχεία που βλέπει ο
+browser, και την ιδιωτική πηγή (RTSP URL/credentials) που μένει server-side.
+
+### Δημόσια στοιχεία (`WX_CAMERAS`)
+
+Δεν υπάρχουν προεπιλεγμένα URLs. Η σύντομη μορφή αρκεί:
 
 ```bash
 WX_CAMERAS='{"ilioupoli":"https://YOUR_SNAPSHOT_URL_1","glinado":"https://YOUR_SNAPSHOT_URL_2"}'
 ```
 
 Το κλειδί επιλέγει ένα από τα δύο ενσωματωμένα σημεία, οπότε όνομα, περιοχή και
-συντεταγμένες έρχονται από εκεί· η τιμή είναι το snapshot URL. Πλήρης μορφή, όταν
-χρειάζεται timelapse ή δικό σου όνομα/θέση:
+συντεταγμένες έρχονται από εκεί· η τιμή είναι το snapshot URL. Πλήρης μορφή:
 
 ```bash
 WX_CAMERAS='[{"id":"ilioupoli","name":"Ilioupoli Sky","lat":37.9333,"lon":23.75,
-  "snapshot":"https://cam.example/latest.jpg","timelapse":"https://cam.example/today.mp4"}]'
+  "snapshot":"https://cam.example/latest.jpg","timelapse":"https://cam.example/today.mp4",
+  "snapshot_interval_min":5,
+  "live_enabled":true,"live_provider":"youtube","youtube_live_id":"PUBLIC_ID"}]'
 ```
 
-Κάμερα χωρίς `snapshot` εμφανίζεται ως `not_configured` με ρητό μήνυμα, όχι ως
-σπασμένη εικόνα. Ο browser φορτώνει την εικόνα απευθείας από το feed, οπότε δεν
-γίνεται server-side fetch προς URL που προέρχεται από ρύθμιση.
+Κάμερα χωρίς `snapshot` (ή με snapshot που δεν είναι έγκυρο public http/https URL)
+εμφανίζεται ως `not_configured` με ρητό μήνυμα, όχι ως σπασμένη εικόνα. `enabled:
+false` κρύβει την κάμερα εντελώς — ούτε στη λίστα ούτε στο detail.
+
+### Snapshot mode (default)
+
+Η default λειτουργία· χαμηλή κατανάλωση. Ο browser δείχνει την τελευταία εικόνα
+του feed και την ξαναφορτώνει ανά `snapshot_interval_min` (1/2/5/10/15/30/60
+λεπτά· default 5). Δεν υπάρχει video/stream προς τον server.
+
+### Live mode (provider abstraction)
+
+Το live **δεν** είναι WebRTC: είναι *provider*. Σήμερα `live_provider="youtube"`
+με ένα **δημόσιο** `youtube_live_id`, που ενσωματώνεται με τον επίσημο YouTube
+player σε `youtube-nocookie.com`. Το `live_provider` είναι whitelisted — άγνωστη
+τιμή → κανένα live block. Το LIVE ανοίγει μόνο μετά από κλικ (`🔴 LIVE`), δεν
+γίνεται autoplay στο page load, και καμία διεύθυνση κάμερας δεν φτάνει στον
+browser. Άλλοι providers (`webrtc`, `hls`) μπαίνουν αργότερα ως νέα εγγραφή στο
+`LIVE_PROVIDERS`, χωρίς redesign.
+
+### Ιδιωτική πηγή (`WX_CAMERA_SOURCES`) — server-side μόνο
+
+```bash
+WX_CAMERA_SOURCES='[{"id":"ilioupoli","url":"rtsp://CAMERA_LAN_HOST:554/Streaming/Channels/101",
+  "username":"viewer","secret_ref":"WX_CAMERA_ILIOUPOLI_PASS"}]'
+WX_CAMERA_ALLOWED_HOSTS=CAMERA_LAN_HOST
+```
+
+* Μόνο το μέλλον streaming pipeline τη διαβάζει (`cameras.source_for`), **καμία**
+  HTTP διαδρομή δεν την επιστρέφει.
+* Τα credentials **δεν** μπαίνουν στο URL — `username` + `secret_ref` (όνομα
+  μεταβλητής που κρατά το password).
+* `WX_CAMERA_ALLOWED_HOSTS` (προαιρετικό) περιορίζει hosts.
+* `audio:true` απορρίπτεται: **video-only**.
+* Για να προσθέσεις κάμερα αργότερα: μια εγγραφή στο `WX_CAMERAS` (public) και,
+  όταν συνδεθεί το pipeline, μια στο `WX_CAMERA_SOURCES` (private). Καμία αλλαγή
+  κώδικα σε πολλά σημεία.
+
+Endpoints: `GET /api/cameras` (λίστα) και `GET /api/cameras/{id}` (detail) —
+δημόσια, ίδια βάση με πριν, χωρίς URL parameter. Άγνωστο ή disabled id → 404.
 
 ## Βαθμίδες
 
@@ -524,6 +566,32 @@ download, και στα logs να εμφανίζεται `grid restored from dis
 **Επαναφορά**: βάλε `WX_USE_RAM_GRIDS=0` (ή σβήσε τη γραμμή) και κάνε restart.
 Το per-point cache αναλαμβάνει αμέσως· τα αρχεία κάτω από `WX_CACHE_DIR/grids/`
 μπορούν να διαγραφούν χειροκίνητα.
+
+### Μελλοντικό live streaming (RTSP → YouTube)
+
+**Δεν έχει εγκατασταθεί τίποτα από αυτά.** Είναι το σχέδιο για όταν έρθει η ώρα
+να ενεργοποιηθεί πραγματική κάμερα· ο σημερινός κώδικας είναι η ασφαλής βάση.
+
+Η ροή που θέλουμε:
+
+```
+Hikvision RTSP ──► server-side stream layer ──► YouTube Live ──► YouTube embed
+   (private LAN)      (video-only, no audio)      (public)         (στο app)
+```
+
+Τι θα χρειαστεί στον VPS τότε (ξεχωριστή απόφαση, όχι τώρα):
+
+* ένα service που διαβάζει RTSP από το ιδιωτικό δίκτυο κάμερας και το στέλνει
+  στο YouTube Live (π.χ. `ffmpeg`/`MediaMTX` σε **βίντεο μόνο**: `-an`, καμία
+  διαδρομή audio),
+* κρεντενσιαλς κάμερας σε `.env`/secret store του VPS — ποτέ στο repo, ποτέ στον
+  browser,
+* το ιδιωτικό δίκτυο να μην εκτίθεται στο Internet· μόνο ο stream layer βγαίνει
+  προς τα έξω,
+* το δημόσιο `youtube_live_id` στο `WX_CAMERAS`.
+
+Ο browser δεν μαθαίνει ποτέ RTSP URL, IP, port ή credential — μόνο το δημόσιο
+YouTube id μέσω `cameras.public_camera`.
 
 ### Backups
 

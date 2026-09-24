@@ -62,6 +62,7 @@ EVENTS = frozenset({
     "promo_code_opened",
     "promo_code_redeemed",
     "sky_camera_opened",
+    "sky_camera_live_opened",
     "verification_viewed",
     "notify_enabled",
     "notify_disabled",

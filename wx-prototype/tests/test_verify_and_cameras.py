@@ -122,8 +122,20 @@ def test_malformed_camera_env_falls_back_to_defaults(monkeypatch):
 
 
 def test_camera_typos_do_not_produce_invalid_types(monkeypatch):
-    _with_cameras(monkeypatch, '[{"id":"x","lat":"not-a-number","lon":null,"snapshot":"u"}]')
+    _with_cameras(monkeypatch, '[{"id":"x","lat":"not-a-number","lon":null,'
+                               '"snapshot":"https://cam.example/x.jpg"}]')
     cam = cams.camera_payload()["cameras"][0]
     assert cam["lat"] is None and cam["lon"] is None
     assert cam["status"] == "live"        # a feed exists even if the coords are junk
     assert cam["name"] == "x"             # name falls back to the id, never missing
+
+
+def test_camera_snapshot_that_is_not_a_public_url_is_not_configured(monkeypatch):
+    """A snapshot must be a public http(s) URL. Anything else is reported as not
+    configured rather than placed in an <img src>, so a paste error cannot become
+    a broken card or a non-http scheme the browser would reject."""
+    _with_cameras(monkeypatch, '[{"id":"x","snapshot":"javascript:alert(1)"},'
+                               '{"id":"y","snapshot":"u"}]')
+    by_id = {c["id"]: c for c in cams.camera_payload()["cameras"]}
+    assert by_id["x"]["snapshot"] is None and by_id["x"]["status"] == "not_configured"
+    assert by_id["y"]["snapshot"] is None and by_id["y"]["status"] == "not_configured"

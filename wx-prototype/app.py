@@ -898,6 +898,18 @@ td.ph{background:linear-gradient(90deg,rgba(255,255,255,.08),rgba(255,255,255,.1
 .cam .actions button[disabled]{opacity:.45;cursor:not-allowed}
 .cam .notebox{font-size:11.5px;color:var(--warn);background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.30);
   border-radius:7px;padding:7px 9px;margin-top:10px;line-height:1.55}
+.cam .cad{font-size:11.5px;color:var(--dim);margin-top:6px}
+.cam .stage .golive{position:absolute;bottom:9px;right:9px;background:rgba(17,17,17,.78);color:#fff;
+  border:1px solid rgba(255,255,255,.18);font-size:11.5px;font-weight:700;letter-spacing:.04em;
+  padding:6px 12px;border-radius:20px;cursor:pointer;backdrop-filter:blur(4px)}
+.cam .stage .golive:hover{background:rgba(255,59,48,.85)}
+.cam .stage.playing img{visibility:hidden}
+.cam .stage .camframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}
+.cam .stage .closecam{position:absolute;top:9px;right:9px;z-index:2;background:rgba(17,17,17,.78);
+  color:#fff;border:1px solid rgba(255,255,255,.18);font-size:11.5px;padding:5px 11px;
+  border-radius:18px;cursor:pointer;font-family:inherit}
+.cam .stage .livefb{position:absolute;inset:auto 12px 12px 12px;z-index:2;background:rgba(17,17,17,.85);
+  color:var(--dim);font-size:12px;padding:9px 11px;border-radius:8px;text-align:center}
 .camhead{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .toggle{display:inline-flex;align-items:center;gap:9px;font-size:13px;cursor:pointer;
   border:1px solid var(--line);background:var(--card);border-radius:22px;padding:7px 14px;
@@ -2966,19 +2978,87 @@ function renderCameras(){
     const badge = live
       ? '<div class="live"><i></i>LIVE</div>'
       : '<div class="live off"><i></i>OFFLINE</div>';
+    // The LIVE affordance exists only when the server published a live block:
+    // a supported provider with a valid public id. With no live configured it is
+    // not rendered at all, so there is never a button that opens nothing.
+    const golive = (live && c.live)
+      ? '<button class="golive" onclick="openCamLive(\''+esc(c.id)+'\')">🔴 LIVE</button>'
+      : '';
     const tl = c.timelapse
       ? '<a href="'+esc(c.timelapse)+'" target="_blank" rel="noopener"><button>Timelapse</button></a>'
       : '<button disabled title="Δεν έχει ρυθμιστεί timelapse">Timelapse</button>';
     const note = live? '' :
       '<div class="notebox">Η ζωντανή ροή δεν έχει συνδεθεί ακόμη. Όρισε <code>WX_CAMERAS</code> με το snapshot URL.</div>';
     const mapq=c.lat!=null&&c.lon!=null? ' onclick="gotoPoint('+c.lat+','+c.lon+',\''+esc(c.name)+'\')"' : '';
-    return '<div class="cam">'
-      +'<div class="stage">'+stage+badge+'</div>'
+    const cadence = live
+      ? '<div class="cad">Αυτόματη εικόνα: κάθε '+c.snapshot_interval_min+' '+pluralMin(c.snapshot_interval_min)+'</div>'
+      : '';
+    return '<div class="cam" id="camcard-'+esc(c.id)+'">'
+      +'<div class="stage" id="camstage-'+esc(c.id)+'">'+stage+badge+golive+'</div>'
       +'<div class="meta"><div class="nm">'+esc(c.name)+'</div>'
       +'<div class="rg">'+esc(c.region||'')+(c.lat!=null?' · '+c.lat.toFixed(2)+', '+c.lon.toFixed(2):'')+'</div>'
+      +cadence
       +'<div class="actions">'+(c.lat!=null?'<button'+mapq+'>Στην πρόγνωση</button>':'')+tl+'</div>'
       +note+'</div></div>';
   }).join('');
+}
+function pluralMin(n){ return n===1? 'λεπτό':'λεπτά'; }
+/* Live playback is a *provider* concern, not a WebRTC one. Today the only
+   provider is YouTube, embedded through the official player with the public
+   video id the server publishes. The camera's own address never reaches the
+   browser, so there is no RTSP URL to leak. Opening is a user action (so autoplay
+   is allowed), and closing restores the last snapshot the card already holds. */
+function youtubeEmbedUrl(videoId){
+  // Privacy-enhanced mode, per YouTube's documentation. `mute=1` is a default,
+  // not the audio guarantee: audio is kept out of the stream pipeline itself.
+  const q=new URLSearchParams({autoplay:'1',mute:'1',playsinline:'1',rel:'0'});
+  return 'https://www.youtube-nocookie.com/embed/'+encodeURIComponent(videoId)
+    +'?'+q.toString();
+}
+function openCamLive(id){
+  if(!CAMS) return;
+  const c=CAMS.cameras.find(x=>x.id===id);
+  if(!c||!c.live) return;
+  const stage=document.getElementById('camstage-'+id);
+  if(!stage) return;
+  track('sky_camera_live_opened');
+  stage.classList.add('playing');
+  if(c.live.provider==='youtube'){
+    const f=document.createElement('iframe');
+    f.className='camframe';
+    f.title=c.name+' — LIVE';
+    f.setAttribute('allow','autoplay; encrypted-media; picture-in-picture; fullscreen');
+    f.setAttribute('allowfullscreen','');
+    f.src=youtubeEmbedUrl(c.live.video_id);
+    f.onerror=()=>{ showLiveFallback(stage,'Ο player δεν φόρτωσε. Δοκίμασε ξανά.'); };
+    stage.appendChild(f);
+    // Autoplay can be refused; the official player then shows its own play
+    // control, which is the correct fallback. Never assume it started.
+  } else {
+    showLiveFallback(stage,'Ο πάροχος ζωντανής ροής δεν υποστηρίζεται.');
+  }
+  const close=document.createElement('button');
+  close.className='closecam'; close.textContent='Κλείσιμο LIVE';
+  close.onclick=()=>closeCamLive(id);
+  stage.appendChild(close);
+}
+function closeCamLive(id){
+  const stage=document.getElementById('camstage-'+id);
+  if(!stage) return;
+  stage.classList.remove('playing');
+  stage.querySelectorAll('.camframe,.closecam,.livefb').forEach(n=>n.remove());
+  const c=CAMS&&CAMS.cameras.find(x=>x.id===id);
+  const img=document.getElementById('camimg-'+id);
+  if(c&&img){ // refresh to the newest frame rather than the stale one
+    CAMS.stamp=Math.floor(Date.now()/60000);
+    const sep=c.snapshot.includes('?')?'&':'?';
+    img.src=c.snapshot+sep+'t='+CAMS.stamp;
+  }
+}
+function showLiveFallback(stage,msg){
+  const d=document.createElement('div');
+  d.className='livefb'; d.textContent=msg;
+  stage.appendChild(d);
 }
 function gotoPoint(lat,lon,name){
   // Straight to the forecast for the camera's own coordinates, rather than
@@ -3889,6 +3969,10 @@ async def health():
         # confirm at a glance that raw events are bounded, not accumulating.
         "analytics": {"enabled": analytics.enabled(),
                       "retention_days": analytics.retention_days()},
+        # Cameras: counts only, never a source URL or credential. `sources` tells
+        # an operator whether the private store parsed; a malformed blob shows
+        # here as 0 without printing what it contained.
+        "cameras": cams.health(),
         "data_sources": ["GFS (public domain)", "ICON-EU DWD (CC BY 4.0)",
                          "ECMWF open data (CC BY 4.0, best-effort)",
                          "Photon geocoding (OSM)", "OpenTopoData DEM"],
@@ -4544,8 +4628,28 @@ def attribution_block() -> dict:
 
 @app.get("/api/cameras")
 async def cameras_endpoint():
-    """Camera metadata for the UI. Public: it is a marketing surface, not data."""
+    """Camera metadata for the UI. Public: it is a marketing surface, not data.
+
+    Only public metadata crosses the boundary. Private source material (RTSP
+    URL, credentials) lives in a separate store that no endpoint reads; the
+    payload is built from an explicit whitelist in cameras.py, so a new private
+    key cannot leak by being carried along.
+    """
     return cams.camera_payload()
+
+
+@app.get("/api/cameras/{camera_id}")
+async def camera_endpoint(camera_id: str):
+    """One camera's public metadata, by id. Unknown and disabled both 404.
+
+    The id is looked up in server-side configuration and never used to build a
+    URL, so an arbitrary id cannot reach any feed or private source. A camera
+    that an operator disabled is indistinguishable from one that never existed.
+    """
+    cam = cams.find_camera(camera_id)
+    if cam is None:
+        raise HTTPException(404, "Η κάμερα δεν υπάρχει.")
+    return cam
 
 
 @app.get("/api/verify")
