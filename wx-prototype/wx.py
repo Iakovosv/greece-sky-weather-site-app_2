@@ -17,12 +17,18 @@ import bz2
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import time
 
 import httpx
 import numpy as np
 import xarray as xr
+
+import cachestore
+import config
+
+log = logging.getLogger("wx.wx")
 
 UA = {"User-Agent": "greece-sky-weather/0.2 (+https://github.com/Iakovosv/greece-sky-weather-site-app)"}
 NOMADS = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
@@ -35,28 +41,48 @@ CACHE_DIR = os.environ.get("WX_CACHE_DIR", "/tmp/wx-cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
+# ---------------------------------------------------------------- request guards
+#
+# The only callers that reach these are the endpoint handlers, and each of them
+# validates the coordinate first. They are kept here as a second line of defence
+# for internal callers (the scheduler, a test), because the cost of getting it
+# wrong is a whole-global GRIB download rather than an error message.
+
+class OutOfRange(ValueError):
+    """A coordinate that cannot be used against a weather model."""
+
+
+def check_point(lat: float, lon: float) -> None:
+    """Raise OutOfRange unless (lat, lon) is a real point on Earth."""
+    reason = config.coord_error(lat, lon)
+    if reason:
+        raise OutOfRange(reason)
+
+
 # ---------------------------------------------------------------- cache
+#
+# Delegated to cachestore, which adds a size ceiling, eviction and recovery from
+# a truncated entry. `WX_CACHE_DIR` is resolved on every call so a `.env` loaded
+# by app.py actually reaches it, and so tests can redirect it.
+
+def cache_dir() -> str:
+    return cachestore.cache_dir()
+
 
 def _cache_path(key: str) -> str:
-    return os.path.join(CACHE_DIR, hashlib.sha256(key.encode()).hexdigest()[:32])
+    return cachestore._path(key)
 
 
 def cache_get(key: str, ttl: int) -> bytes | None:
-    p = _cache_path(key)
-    try:
-        if time.time() - os.path.getmtime(p) < ttl:
-            return open(p, "rb").read()
-    except OSError:
-        pass
-    return None
+    return cachestore.get(key, ttl)
 
 
 def cache_put(key: str, blob: bytes) -> None:
-    p = _cache_path(key)
-    tmp = f"{p}.tmp{os.getpid()}"
-    with open(tmp, "wb") as f:
-        f.write(blob)
-    os.replace(tmp, p)
+    cachestore.put(key, blob)
+
+
+def cache_stats() -> dict:
+    return cachestore.stats()
 
 
 _NOMADS_SEM: asyncio.Semaphore | None = None
@@ -130,6 +156,11 @@ def _varsig() -> str:
 async def gfs_surface_step(client: httpx.AsyncClient, lat: float, lon: float,
                            date: str, hh: str, step: int) -> dict:
     """One forecast hour of surface fields, server-side subset to a tiny box."""
+    # An out-of-range coordinate is not a NOMADS error: the filter clamps the
+    # sub-region to the whole grid and returns a full-planet field, which is how a
+    # single `lat=999` request produced a 419 MB cache entry. Reject before any
+    # request is made.
+    check_point(lat, lon)
     # The variable set is part of the key: without it, adding a field to
     # GFS_SFC_VARS keeps serving cached blobs that predate the field.
     key = f"gfs-sfc|{date}{hh}|{step}|{lat:.2f},{lon:.2f}|{_varsig()}"
@@ -144,7 +175,7 @@ async def gfs_surface_step(client: httpx.AsyncClient, lat: float, lon: float,
         blob = await nomads_get(client, params)
         cache_put(key, blob)
 
-    path = os.path.join(CACHE_DIR, f"gfs-sfc-{os.getpid()}-{step}.grib2")
+    path = os.path.join(cache_dir(), f"gfs-sfc-{os.getpid()}-{step}.grib2")
     with open(path, "wb") as f:
         f.write(blob)
 
@@ -209,6 +240,7 @@ async def gfs_surface_series(lat: float, lon: float, hours: int = 48) -> list[di
     a nonexistent f121 would fail, so the step list is built from the cadence
     rather than assuming everything is hourly.
     """
+    check_point(lat, lon)
     date, hh = latest_gfs_run()
     steps = gfs_steps(hours)
 
@@ -242,6 +274,7 @@ async def gfs_profile_dataset(client: httpx.AsyncClient, lat: float, lon: float,
     latest_gfs_run probes the network; deriving it twice could name a different
     cycle than the one actually downloaded.
     """
+    check_point(lat, lon)
     date, hh = latest_gfs_run()
     key = f"gfs-prof|{date}{hh}|{step}|{lat:.2f},{lon:.2f}"
     blob = cache_get(key, ttl=3 * 3600)
@@ -254,7 +287,7 @@ async def gfs_profile_dataset(client: httpx.AsyncClient, lat: float, lon: float,
         blob = await nomads_get(client, params)
         cache_put(key, blob)
 
-    path = os.path.join(CACHE_DIR, f"gfs-prof-{os.getpid()}-{step}.grib2")
+    path = os.path.join(cache_dir(), f"gfs-prof-{os.getpid()}-{step}.grib2")
     with open(path, "wb") as f:
         f.write(blob)
     ds = xr.open_dataset(path, engine="cfgrib", backend_kwargs={
@@ -289,6 +322,7 @@ async def icon_eu_point(client: httpx.AsyncClient, lat: float, lon: float,
     One bz2 file per variable per step covering all of Europe, so these downloads
     are ~1 MB each and must be cached aggressively.
     """
+    check_point(lat, lon)
     run = run or icon_eu_latest_run()
     short = ICON_EU_VARS[var]
     key = f"icon-eu|{run}|{var}|{step}"
@@ -301,7 +335,7 @@ async def icon_eu_point(client: httpx.AsyncClient, lat: float, lon: float,
         blob = bz2.decompress(r.content)
         cache_put(key, blob)
 
-    path = os.path.join(CACHE_DIR, f"icon-eu-{os.getpid()}-{short}-{step}.grib2")
+    path = os.path.join(cache_dir(), f"icon-eu-{os.getpid()}-{short}-{step}.grib2")
     with open(path, "wb") as f:
         f.write(blob)
     try:
@@ -327,6 +361,7 @@ async def ecmwf_point(client: httpx.AsyncClient, lat: float, lon: float,
     intermittent 404s for steps that do exist, so callers must degrade gracefully
     and must never treat this as the primary source.
     """
+    check_point(lat, lon)
     date = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=8)).strftime("%Y%m%d")
     stem = f"{ECMWF_OD}/{date}/{hh}z/ifs/0p25/oper/{date}{hh}0000-{step}h-oper-fc"
     r = await client.get(f"{stem}.index")
@@ -341,7 +376,7 @@ async def ecmwf_point(client: httpx.AsyncClient, lat: float, lon: float,
         rr = await client.get(f"{stem}.grib2",
                               headers={**UA, "Range": f"bytes={start}-{start + length - 1}"})
         rr.raise_for_status()
-        path = os.path.join(CACHE_DIR, f"ec-{os.getpid()}-{row['param']}.grib2")
+        path = os.path.join(cache_dir(), f"ec-{os.getpid()}-{row['param']}.grib2")
         with open(path, "wb") as f:
             f.write(rr.content)
         try:
@@ -370,6 +405,7 @@ async def gfs_orography(client: httpx.AsyncClient, lat: float, lon: float,
     correction: a user on a 1000 m ridge gets a different temperature from a model
     cell whose mean height is 236 m.
     """
+    check_point(lat, lon)
     key = f"gfs-orog|{date}{hh}|{lat:.2f},{lon:.2f}"
     blob = cache_get(key, ttl=12 * 3600)
     if blob is None:
@@ -381,7 +417,7 @@ async def gfs_orography(client: httpx.AsyncClient, lat: float, lon: float,
         blob = await nomads_get(client, params)
         cache_put(key, blob)
 
-    path = os.path.join(CACHE_DIR, f"gfs-orog-{os.getpid()}.grib2")
+    path = os.path.join(cache_dir(), f"gfs-orog-{os.getpid()}.grib2")
     with open(path, "wb") as f:
         f.write(blob)
     try:

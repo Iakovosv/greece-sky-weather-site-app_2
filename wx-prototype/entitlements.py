@@ -26,14 +26,31 @@ import secrets
 import time
 from dataclasses import dataclass
 
-SECRET = os.environ.get("WX_SECRET") or "dev-only-insecure-secret-change-me"
-MASTER_CODE = os.environ.get("WX_MASTER_CODE", "GSW-PRO-2026")
+import config
+
+# `SECRET` is kept as a module attribute for callers that read it, but every
+# sign/verify goes through `secret()`, which resolves the environment on each
+# call. That ordering matters: `app.py` loads `.env` *after* importing this
+# module, so a module-level snapshot would keep the development default even when
+# `WX_SECRET` was configured in `.env` — which is exactly the bug this fixes.
+SECRET = config.signing_secret()
+MASTER_CODE = config.master_code()
 
 FREE_HOURS = 72
 PRO_HOURS = 240          # 10 days
 TOKEN_TTL_S = 60 * 60 * 24 * 30
 TRIAL_HOURS = 240        # a trial sees the full PRO window
 TRIAL_TTL_S = 60 * 60 * 48   # 2 days
+
+
+def secret() -> str:
+    """Current signing key, resolved from the environment on every call."""
+    return config.signing_secret()
+
+
+def master_code() -> str:
+    """The comp/test passcode, resolved on every call (same .env timing reason)."""
+    return config.master_code()
 
 # Pricing. Kept here so the API and the UI cannot drift apart.
 PRICING = {
@@ -61,8 +78,17 @@ class Entitlement:
     tier: str            # "free" or "pro"
     hours: int
     expires_at: int | None
-    source: str          # "free" | "passcode" | "subscription" | "trial"
+    source: str          # "free" | "passcode" | "subscription" | "trial" | "promo"
     subscription_id: str | None = None
+    device: str | None = None
+    # The moment PRO access actually ends, after subscription state and any promo
+    # window are considered. `expires_at` is when the *token* stops being accepted;
+    # the two differ for a subscription whose Stripe period ends before the token
+    # does, and for a promo code, whose own expiry governs.
+    pro_until: int | None = None
+    # Free-form notes about why the effective window is what it is, so the UI can
+    # say "promo until <date>" or "subscription ended" rather than guessing.
+    notes: tuple[str, ...] = ()
 
     @property
     def is_pro(self) -> bool:
@@ -78,13 +104,20 @@ def _b64d(s: str) -> bytes:
 
 
 def _sign(payload: bytes) -> str:
-    return _b64e(hmac.new(SECRET.encode(), payload, hashlib.sha256).digest())
+    return _b64e(hmac.new(secret().encode(), payload, hashlib.sha256).digest())
 
 
 def issue_token(tier: str = "pro", source: str = "passcode", ttl: int = TOKEN_TTL_S,
-                subscription_id: str | None = None) -> str:
+                subscription_id: str | None = None,
+                device: str | None = None) -> str:
     data: dict = {"tier": tier, "src": source, "exp": int(time.time()) + ttl,
                   "nonce": secrets.token_hex(6)}
+    if device:
+        # An opaque per-browser id, minted once and carried in the signed token.
+        # It exists so a promo code can be limited to *a* visitor without an
+        # accounts table. It is not derived from IP, user agent or anything else
+        # about the device: it is a random string the server hands out.
+        data["dev"] = device
     if subscription_id:
         # Carried in the signed payload so the holder can manage their own
         # subscription without an accounts table. It is only an identifier; the
@@ -114,8 +147,9 @@ def verify_token(token: str | None) -> Entitlement:
         return free
     if data.get("tier") != "pro":
         return free
-    return Entitlement("pro", PRO_HOURS, int(data["exp"]), data.get("src", "passcode"),
-                       data.get("sub"))
+    exp = int(data["exp"])
+    return Entitlement("pro", PRO_HOURS, exp, data.get("src", "passcode"),
+                       data.get("sub"), data.get("dev"), pro_until=exp)
 
 
 def check_passcode(code: str) -> str | None:
@@ -123,12 +157,12 @@ def check_passcode(code: str) -> str | None:
 
     Constant-time comparison so the endpoint does not leak the code by timing.
     """
-    if code and hmac.compare_digest(code.encode(), MASTER_CODE.encode()):
+    if code and hmac.compare_digest(code.encode(), master_code().encode()):
         return issue_token("pro", "passcode")
     return None
 
 
-def issue_trial() -> str:
+def issue_trial(device: str | None = None) -> str:
     """A real 2-day trial: full PRO window, expiring on its own.
 
     NOTE: nothing here stops the same visitor starting a trial repeatedly — the
@@ -136,7 +170,7 @@ def issue_trial() -> str:
     trial to one per account or device needs the accounts layer; until then this
     is a working flow, not an abuse-proof one.
     """
-    return issue_token("pro", "trial", ttl=TRIAL_TTL_S)
+    return issue_token("pro", "trial", ttl=TRIAL_TTL_S, device=device)
 
 
 def plan_payload() -> dict:

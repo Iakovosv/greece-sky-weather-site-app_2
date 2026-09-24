@@ -39,12 +39,34 @@ WX_PUBLIC_BASE_URL     absolute base URL of this site, for the redirect URLs
 """
 from __future__ import annotations
 
+import logging
 import os
+import threading
+import time
+
+log = logging.getLogger("wx.billing")
 
 # Auto-renewal is Stripe's default for subscriptions. Nothing here turns it off;
 # `cancel_at` on the subscription is what later opts a user out, preserving the
 # period they already paid for.
 AUTO_RENEW_BY_DEFAULT = True
+
+# How long a subscription's state may be reused before Stripe is asked again.
+# Ten minutes is short enough that a cancellation takes effect while the user is
+# still on the site, and long enough that a page with several PRO requests does
+# not turn into several Stripe calls. The lookup is keyed by subscription id and
+# is only performed for tokens that carry one.
+STATE_TTL_S = int(os.environ.get("WX_SUB_STATE_TTL_S", str(10 * 60)))
+
+# Statuses that can still grant access, with the period they grant it for.
+# `active` and `trialing` are obvious. `past_due` is included because Stripe is
+# still retrying the card and cutting access off at the first failed charge would
+# punish a customer whose bank is slow; `unpaid`, `incomplete` and
+# `incomplete_expired` are not, because no successful payment backs them.
+ACCESS_STATUSES = ("active", "trialing", "past_due")
+# `canceled` grants nothing new, but the period already paid for still counts —
+# that is what the refund policy promises.
+PERIOD_STATUSES = ACCESS_STATUSES + ("canceled",)
 
 _PLAN_ENV = {"monthly": "WX_STRIPE_PRICE_MONTHLY", "yearly": "WX_STRIPE_PRICE_YEARLY"}
 
@@ -106,6 +128,120 @@ def missing_config() -> list[str]:
 
 def checkout_available() -> bool:
     return _stripe() is not None and not missing_config()
+
+
+# ---------------------------------------------------------------- state cache
+
+_STATE_LOCK = threading.Lock()
+_STATE: dict[str, tuple[float, dict]] = {}
+# Failures are cached separately, and briefly, so a Stripe outage does not make
+# every PRO request wait on a connection timeout.
+_FAILED: dict[str, float] = {}
+FAILURE_TTL_S = 60
+
+
+def _cache_get(subscription_id: str) -> dict | None:
+    with _STATE_LOCK:
+        hit = _STATE.get(subscription_id)
+    if hit and (time.time() - hit[0]) < STATE_TTL_S:
+        return hit[1]
+    return None
+
+
+def _cache_put(subscription_id: str, state: dict) -> None:
+    with _STATE_LOCK:
+        _STATE[subscription_id] = (time.time(), state)
+        _FAILED.pop(subscription_id, None)
+
+
+def cache_forget(subscription_id: str | None = None) -> None:
+    """Drop cached state, so the next lookup is fresh.
+
+    Called from the webhook: Stripe is the authority on a change it just told us
+    about, so serving a ten-minute-old cached state after `payment_failed` would
+    be actively wrong.
+    """
+    with _STATE_LOCK:
+        if subscription_id is None:
+            _STATE.clear()
+            _FAILED.clear()
+        else:
+            _STATE.pop(subscription_id, None)
+            _FAILED.pop(subscription_id, None)
+
+
+def _recently_failed(subscription_id: str) -> bool:
+    with _STATE_LOCK:
+        at = _FAILED.get(subscription_id)
+    return at is not None and (time.time() - at) < FAILURE_TTL_S
+
+
+def _mark_failed(subscription_id: str) -> None:
+    with _STATE_LOCK:
+        _FAILED[subscription_id] = time.time()
+
+
+def cached_subscription_state(subscription_id: str, refresh: bool = False) -> dict:
+    """Subscription state, served from a short-lived cache.
+
+    Raises on failure. The cache is deliberately not a *verification bypass*: it
+    only avoids repeating a lookup that was made moments ago, and it is dropped
+    whenever the webhook reports a change.
+    """
+    if not refresh:
+        hit = _cache_get(subscription_id)
+        if hit is not None:
+            return hit
+        if _recently_failed(subscription_id):
+            raise RuntimeError("subscription lookup recently failed")
+    try:
+        state = subscription_state(subscription_id)
+    except Exception:
+        _mark_failed(subscription_id)
+        raise
+    _cache_put(subscription_id, state)
+    return state
+
+
+def subscription_access(subscription_id: str, refresh: bool = False) -> dict:
+    """Whether this subscription may grant PRO right now, and until when.
+
+    The three answers the caller needs:
+      * ``active``   — yes, and here is the period end.
+      * ``grace``    — a period that already lapsed but is still inside the
+                        window Stripe reports; access continues to `until`.
+      * ``inactive`` — no, and the reason.
+
+    A lookup that cannot be completed does **not** silently grant access. It
+    returns ``unknown`` with ``fail_open=False``, and the caller decides. The
+    endpoint treats `unknown` as "keep the last known good answer for this token"
+    by falling back to the token's own expiry — see `app.effective_entitlement`.
+    """
+    try:
+        state = cached_subscription_state(subscription_id, refresh=refresh)
+    except Exception as e:
+        return {"status": "unknown", "active": False, "until": None,
+                "error": f"{type(e).__name__}: {str(e)[:120]}"}
+
+    status = (state.get("status") or "").lower()
+    until = state.get("cancel_at") or state.get("current_period_end")
+    until = int(until) if until else None
+
+    if status in ACCESS_STATUSES:
+        return {"status": status, "active": True, "until": until,
+                "auto_renew": bool(state.get("auto_renew"))}
+    if status in PERIOD_STATUSES and until and until > time.time():
+        # Cancelled but still inside the paid period.
+        return {"status": status, "active": True, "until": until,
+                "auto_renew": False, "reason": "paid period not yet expired"}
+    if status in ("unpaid", "incomplete", "incomplete_expired", "paused"):
+        return {"status": status, "active": False, "until": until,
+                "reason": "no successful payment backs this subscription"}
+    if status in ("canceled", "cancelled"):
+        return {"status": status, "active": False, "until": until,
+                "reason": "subscription was cancelled and the paid period has ended"}
+    return {"status": status or "unknown", "active": False, "until": until,
+            "reason": "unrecognised subscription status"}
 
 
 def create_checkout(plan: str, customer_email: str | None = None,

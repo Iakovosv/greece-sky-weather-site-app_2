@@ -151,7 +151,7 @@ def _decode_icon(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _write_tmp(blob: bytes) -> str:
-    fd, path = tempfile.mkstemp(suffix=".grib2", dir=wx.CACHE_DIR)
+    fd, path = tempfile.mkstemp(suffix=".grib2", dir=wx.cache_dir())
     with os.fdopen(fd, "wb") as f:
         f.write(blob)
     return path

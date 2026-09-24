@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
+import hmac
 import html
 import io
 import json
 import logging
 import math
 import os
+import secrets
+import time
 
 import httpx
 import matplotlib
@@ -26,14 +30,19 @@ import xarray as xr
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+import analytics
 import astro
 import bias
 import billing as bill
 import cameras as cams
+import config
 import entitlements as ent
 import envfile
 import grids
 import legal
+import logging_setup
+import promo
+import ratelimit
 import scheduler
 import verify as vfy
 import wx
@@ -44,9 +53,78 @@ import wx
 # -e flag is a deployment decision, a stray .env in the cwd is not.
 envfile.load()
 
+# Logging is configured immediately after the environment is loaded, so the
+# level and format can come from `.env`, and so every import-time message from
+# this point on is actually visible. Before this, the root logger had no handler
+# and `log.info` went nowhere.
+logging_setup.configure()
+
 log = logging.getLogger("wx")
 
 app = FastAPI(title="Greece Sky and Weather")
+
+# Endpoints whose rate limit differs from the default. The middleware looks the
+# path up here; anything absent uses DEFAULT.
+_LIMITS = {
+    "/api/brief": ratelimit.FORECAST,
+    "/api/expert": ratelimit.FORECAST,
+    "/api/skewt": ratelimit.FORECAST,
+    "/api/verify": ratelimit.VERIFY,
+    "/api/promo/redeem": ratelimit.REDEEM,
+    "/api/auth/passcode": ratelimit.REDEEM,
+    "/api/auth/trial": ratelimit.REDEEM,
+    "/api/resolve": ratelimit.GEOCODE,
+    "/api/reverse": ratelimit.GEOCODE,
+    "/api/elevation": ratelimit.GEOCODE,
+    "/api/station/ecowitt": ratelimit.STATION,
+    "/api/station/register": ratelimit.STATION,
+    "/api/analytics": ratelimit.ANALYTICS,
+}
+# Paths that must never be throttled: a rate-limited health check reports the
+# service as down, and the legal pages are read by Stripe's crawler.
+_LIMIT_EXEMPT = ("/api/health", "/terms", "/privacy", "/refunds", "/licenses",
+                 "/static/")
+
+
+@app.middleware("http")
+async def _rate_limit(request: Request, call_next):
+    """Token-bucket throttle, and the security headers, in one pass.
+
+    Ordering note: the limiter runs before the route, so an abusive request never
+    reaches a handler that would do a network fetch. That is the point of putting
+    it here rather than inside each handler.
+    """
+    path = request.url.path
+    limit = _LIMITS.get(path)
+    if config.rate_limit_enabled() and limit is not None and _is_throttled_endpoint(path):
+        key = ratelimit.client_key(request, config.trust_proxy_headers())
+        allowed, retry = ratelimit.LIMITER.allow(key, limit)
+        if not allowed:
+            wait = max(1, int(retry + 0.999))
+            log.warning("rate limit hit: path=%s key=%s retry_after=%ds", path, key[:8], wait)
+            return JSONResponse(
+                {"detail": "Πολλά αιτήματα σε σύντομο χρόνο. Δοκίμασε ξανά σε λίγο.",
+                 "retry_after": wait},
+                status_code=429, headers={"Retry-After": str(wait)})
+    response = await call_next(request)
+    return _with_security_headers(response)
+
+
+def _is_throttled_endpoint(path: str) -> bool:
+    return not any(path.startswith(p) for p in _LIMIT_EXEMPT)
+
+
+def _with_security_headers(response: Response) -> Response:
+    """Headers that cost nothing and close a class of browser-side issue.
+
+    No Content-Security-Policy yet: the page inlines its own script and style, so
+    a CSP without a nonce would break it, and a nonce needs the response to be
+    assembled differently. Recorded here as deliberate, not forgotten.
+    """
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
 
 
 @app.on_event("startup")
@@ -57,6 +135,16 @@ async def _report_optional_deps():
     the slowest possible way to learn that `pip` and `uvicorn` are different
     Pythons. The log line names the interpreter, so the fix is one command.
     """
+    log.info("starting: env=%s log_level=%s rate_limit=%s cache_max_mb=%s",
+             config.env_name(), os.environ.get("WX_LOG_LEVEL", "INFO"),
+             "on" if config.rate_limit_enabled() else "off",
+             round(config.cache_max_bytes() / 1e6) if config.cache_max_bytes() else "none")
+    for problem in config.validate_runtime():
+        log.warning("configuration: %s", problem)
+    try:
+        promo.init_db()
+    except Exception as e:
+        log.error("promo database unavailable: %s", e)
     if not astro._HAVE_EPHEM:
         err = astro.import_error()
         if err and astro.is_missing():
@@ -757,10 +845,11 @@ button.primary:hover{filter:brightness(1.08)}
       </div>
       <div class="fcard">
         <div class="ic">🛰️</div>
-        <h3>Συναίνεση 3 μοντέλων (GFS, ECMWF, ICON)</h3>
-        <p>Σύγκριση των κορυφαίων μοντέλων δίπλα-δίπλα. Όταν συμφωνούν, η πρόγνωση
-          είναι αξιόπιστη· όταν αποκλίνουν, το βλέπετε αμέσως.</p>
-        <span class="tag">Δείκτης αξιοπιστίας</span>
+        <h3>Συμφωνία 3 μοντέλων (GFS, ECMWF, ICON)</h3>
+        <p>Σύγκριση των κορυφαίων μοντέλων δίπλα-δίπλα. Όταν συμφωνούν, υπάρχει
+          ομοφωνία μεταξύ τους· όταν αποκλίνουν, το βλέπετε αμέσως. Είναι ένδειξη
+          συμφωνίας, όχι εγγύηση ότι η πρόγνωση θα επαληθευτεί.</p>
+        <span class="tag">Ένδειξη συμφωνίας μοντέλων</span>
       </div>
       <div class="fcard">
         <div class="ic">🌩️</div>
@@ -866,6 +955,19 @@ button.primary:hover{filter:brightness(1.08)}
       <div class="msg" id="pm-code-msg"></div>
     </div>
 
+    <!-- Gift / promo codes. A separate, quieter box from the passcode above:
+         the passcode is the operator's own key, while this is the thing you hand
+         to a friend. Both redeem server-side; neither sets a flag in the browser. -->
+    <details class="codebox" id="pm-promo-wrap">
+      <summary style="font-size:13px">Έχεις κωδικό PRO;</summary>
+      <div class="row">
+        <input id="pm-promo" placeholder="Γράψε τον κωδικό" autocomplete="off"
+               onkeydown="if(event.key==='Enter')redeemPromo()">
+        <button onclick="redeemPromo()">Εξαργύρωση</button>
+      </div>
+      <div class="msg" id="pm-promo-msg"></div>
+    </details>
+
     <div class="note2" id="pm-note"></div>
   </div>
 </div>
@@ -891,8 +993,63 @@ function esc(s){
 const FREE_HOURS=72, PRO_HOURS=240;
 
 /* ---------- plan / modal ---------- */
+/* ---------------------------------------------------------------- analytics
+   First-party and deliberately small. Events are queued and flushed as one
+   batched POST so a visitor who clicks around does not generate a request per
+   click. Coordinates are sent only for forecast events, and the server stores
+   them as a ~50 km cell, never as the point. There is no third-party script and
+   no cookie: turning off `WX_ANALYTICS` on the server makes this endpoint a
+   no-op, and nothing here is needed for the page to work. */
+const WX_EVENTS=[];
+let wxFlushTimer=null;
+function track(name,opts){
+  try{
+    const ev={name};
+    if(opts){
+      if(typeof opts.value==='number') ev.value=opts.value;
+      if(typeof opts.lat==='number'&&isFinite(opts.lat)) ev.lat=opts.lat;
+      if(typeof opts.lon==='number'&&isFinite(opts.lon)) ev.lon=opts.lon;
+      if(opts.meta&&typeof opts.meta==='object') ev.meta=opts.meta;
+    }
+    WX_EVENTS.push(ev);
+    if(WX_EVENTS.length>=20){ flushEvents(); return; }
+    if(wxFlushTimer) return;
+    wxFlushTimer=setTimeout(flushEvents,4000);   // trailing batch
+  }catch(e){}   // analytics must never break the page
+}
+function flushEvents(){
+  if(wxFlushTimer){ clearTimeout(wxFlushTimer); wxFlushTimer=null; }
+  if(!WX_EVENTS.length) return;
+  const batch=WX_EVENTS.splice(0,WX_EVENTS.length);
+  try{
+    const payload=JSON.stringify({events:batch});
+    // sendBeacon survives the page unload that a normal fetch would lose.
+    if(navigator.sendBeacon){
+      navigator.sendBeacon('/api/analytics',new Blob([payload],{type:'application/json'}));
+      return;
+    }
+    fetch('/api/analytics',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:payload,keepalive:true}).catch(()=>{});
+  }catch(e){}
+}
+addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') flushEvents(); });
+addEventListener('pagehide',flushEvents);
+
+/* Opening an expert section is a <details> toggle, not a function call, so the
+   event is read from the DOM once per open rather than instrumenting each
+   renderer. `toggle` fires on every details in the page; the id decides. */
+document.addEventListener('toggle',e=>{
+  const el=e.target;
+  if(!el || !el.open || !el.id) return;
+  if(el.id==='x-skewt') track('skewt_opened');
+  else if(el.id==='x-models') track('model_comparison_opened');
+  else if(el.id==='pm-promo-wrap') track('promo_code_opened');
+},true);
+
 function openModal(){
+  track('pro_paywall_viewed');
   document.getElementById('promodal').classList.add('open');
+  document.getElementById('pm-promo-wrap').open=false;
   // A returning visitor can open the modal straight from the hero, before any
   // forecast has fetched /api/plans; fill it in rather than showing a blank card.
   if(PLANS){ fillPlans(); return; }
@@ -1052,6 +1209,31 @@ async function redeem(){
     setTimeout(()=>{ closeModal(); if(CUR) reload(); },700);
   }catch(e){ msg.className='msg err'; msg.textContent='Σφάλμα: '+e.message; }
 }
+async function redeemPromo(){
+  const code=document.getElementById('pm-promo').value.trim();
+  const msg=document.getElementById('pm-promo-msg');
+  if(!code){ msg.className='msg err'; msg.textContent='Γράψε τον κωδικό.'; return; }
+  msg.className='msg'; msg.textContent='Έλεγχος…';
+  try{
+    const r=await fetch('/api/promo/redeem',{method:'POST',
+      headers:{'Content-Type':'application/json',...(TOKEN?{'X-WX-Token':TOKEN}:{})},
+      body:JSON.stringify({code})});
+    const d=await r.json();
+    if(!r.ok){
+      // The server sends the reason; the wording is deliberately one line.
+      msg.className='msg err';
+      msg.textContent = r.status===409 ? 'Ο κωδικός έχει ήδη χρησιμοποιηθεί.'
+        : r.status===410 ? 'Ο κωδικός έχει λήξει ή εξαντληθεί.'
+        : r.status===404 ? 'Μη έγκυρος ή ληγμένος κωδικός.'
+        : (d.detail || 'Ο κωδικός δεν έγινε δεκτός.');
+      return;
+    }
+    TOKEN=d.token; localStorage.setItem('wx_token',TOKEN);
+    msg.className='msg ok';
+    msg.textContent='Το PRO ενεργοποιήθηκε έως '+d.pro_until_iso+'.';
+    setTimeout(()=>{ closeModal(); if(CUR) reload(); },900);
+  }catch(e){ msg.className='msg err'; msg.textContent='Σφάλμα: '+e.message; }
+}
 async function checkout(){
   const m=document.getElementById('pm-msg');
   m.className='msg err';
@@ -1065,6 +1247,7 @@ async function checkout(){
       body:JSON.stringify({plan:SELECTED_PLAN})});
     const d=await r.json();
     if(!r.ok){ m.className='msg err'; m.textContent=d.detail||'Η πληρωμή δεν ξεκίνησε.'; return; }
+    track('checkout_started',{meta:{plan:SELECTED_PLAN}});
     // Stripe's hosted page handles the card. Nothing card-related touches this app.
     location.href=d.url;
   }catch(e){ m.className='msg err'; m.textContent='Σφάλμα: '+e.message; }
@@ -1134,6 +1317,7 @@ async function setAutoRenew(enabled){
     const d=await r.json();
     if(!r.ok) throw new Error(d.detail||'Σφάλμα');
     SUB=d; renderManage();
+    if(!enabled) track('subscription_cancelled');
     m.className='msg ok';
     m.textContent = enabled ? 'Η αυτόματη ανανέωση ενεργοποιήθηκε.'
       : 'Η αυτόματη ανανέωση απενεργοποιήθηκε. Δεν θα χρεωθείς ξανά.';
@@ -1206,7 +1390,8 @@ function showTab(t){
     document.getElementById('panel-'+n).classList.toggle('active', n===t);
     document.getElementById('tab-'+n).classList.toggle('active', n===t);
   }
-  if(t==='why'){ renderCta(); maybeVerify(); }
+  if(t==='expert') track('expert_opened');
+  if(t==='why'){ track('verification_viewed'); renderCta(); maybeVerify(); }
   if(CHART) CHART.resize();
 }
 /* ---------------------------------------------------------------- favourites
@@ -1324,6 +1509,7 @@ async function search(){
   const r=await (await fetch('/api/resolve?q='+encodeURIComponent(q)+'&lat=39.0&lon=22.0')).json();
   if(!r.length){alert('Δεν βρέθηκε τοποθεσία');return}
   const greek=r.find(x=>x.countrycode==='GR')||r[0];
+  track('location_searched');
   load(greek.latitude,greek.longitude,greek.name+(greek.admin1?' — '+greek.admin1:''));
 }
 /* Manual coordinates, the map's replacement for named-less points. Validated
@@ -1348,6 +1534,7 @@ async function applyManualCoords(){
       +(r.state?' ('+r.state+')':'');
   }catch(e){}
   out.textContent='Φορτώθηκε: '+label;
+  track('map_location_selected');
   load(la,lo,label);
 }
 async function load(lat,lon,label,demPayload,manualElev){
@@ -1387,6 +1574,11 @@ async function load(lat,lon,label,demPayload,manualElev){
   if(manualElev!=null) d._elev.manual_elevation=manualElev;
   if(d.tier){ TIER=d.tier; PLANS=d.tier.plans; }
   if(!PLANS){ try{ PLANS=await (await fetch('/api/plans')).json(); }catch(e){} }
+  track('forecast_loaded',{lat:lat,lon:lon,value:(d.tier&&d.tier.hours)||undefined});
+  if(d.tier){
+    if(d.tier.hours>=72) track('forecast_72h_viewed');
+    if(d.tier.hours>=240) track('forecast_240h_viewed');
+  }
   renderSimple(d); renderExpert(d); renderAttribution(d);
   renderFavourites();
   // Astro runs after the forecast is on screen, so a slow sky calculation never
@@ -1492,7 +1684,8 @@ function renderSimple(d){
   const a=d.expert&&d.expert.agreement;
   if(a){
     h+='<div class="bar '+(a.available?a.class:'unknown')+'"><i></i></div>';
-    h+='<p class="note"><b>Αξιοπιστία: '+a.text+'</b> — '+(a.detail||'μη επαρκή δεδομένα συμφωνίας')+'</p>';
+    h+='<p class="note"><b>Συμφωνία μοντέλων: '+a.text+'</b> — '+(a.detail||'μη επαρκή δεδομένα συμφωνίας')+
+       ' Δεν είναι βεβαιότητα πρόγνωσης, μόνο ένδειξη του πόσο συμφωνούν τα μοντέλα μεταξύ τους.</p>';
   }
   if(d.meta.bias&&d.meta.bias.applied){
     h+='<p class="note">Εφαρμόστηκε διόρθωση τοπικού σταθμού: '
@@ -1855,6 +2048,8 @@ async function loadExpert(){
   root.innerHTML=renderExpertShell();
   renderTierBar(d.tier||TIER,'tierbar-expert');
   expertBody(d);
+  // Tracked after the body is painted, so an event never precedes the view.
+  track('expert_time_changed',{value:XSEL.day*24+XSEL.hour});
 }
 
 function renderExpert(d){
@@ -2213,6 +2408,7 @@ async function loadCameras(){
   }catch(e){
     box.innerHTML='<div class="card err">Οι κάμερες δεν φορτώθηκαν.</div>'; return;
   }
+  track('sky_camera_opened');
   renderCameras();
 }
 function renderCameras(){
@@ -2326,7 +2522,9 @@ function renderVerification(d){
     +esc(d.forecast||'')+'</b>. Μέση τιμή σε πλαίσιο ±'+d.box_deg+'°, ώστε η σύγκριση '
     +'να αφορά την αέρια μάζα και όχι τη διαφορά των πλεγμάτων. Παράθυρο '
     +esc(String(win.first_valid||''))+' → '+esc(String(win.last_valid||''))
-    +' (cycles: '+esc((win.run_dates||[]).join(', '))+').</div>';
+    +' (cycles: '+esc((win.run_dates||[]).join(', '))+').'
+    +' Τα νούμερα είναι δείγμα για τα σημεία και τις ημερομηνίες του παραθύρου, όχι '
+    +'μέτρηση γενικής υπεροχής της πρόγνωσης· διάβασέ τα μαζί με τον αριθμό δειγμάτων.</div>';
   h+='</div>';
   box.innerHTML=h;
 }
@@ -2342,6 +2540,7 @@ async function claimCheckout(sessionId){
     if(!r.ok) throw new Error(d.detail||'Η ενεργοποίηση απέτυχε.');
     TOKEN=d.token; localStorage.setItem('wx_token',TOKEN);
     history.replaceState({},'',location.pathname);   // drop session_id from the URL
+    track('subscription_created');
     await refreshTier();
     if(CUR) await load(CUR.lat,CUR.lon,CUR.label,{elevation_m:CUR.elev});
     else renderCta();
@@ -2356,6 +2555,7 @@ async function claimCheckout(sessionId){
 /* Restore the tier on load, so a stored trial or passcode token is reflected
    in the CTA and the tier bar before any location is chosen. */
 (async function boot(){
+  track('page_view');
   renderFavourites();      // paint saved places before any location is chosen
   loadCameras();
   const q=new URLSearchParams(location.search);
@@ -2830,6 +3030,226 @@ def skewt_png(ds: xr.Dataset, lat: float, lon: float, step: int) -> bytes:
     return buf.getvalue()
 
 
+# ---------------------------------------------------------------- identity & entitlement
+#
+# Three things live here, and they answer one question: what is this caller
+# allowed to see? The answer is computed on the server from three independent
+# sources — the signed token, the live Stripe subscription behind it, and any
+# promo window the device holds — and the frontend never decides it.
+
+DEVICE_COOKIE = "wx_dev"
+DEVICE_MAX_AGE_S = 60 * 60 * 24 * 365 * 2
+
+
+def device_id(request: Request) -> str | None:
+    """The caller's opaque device id, if the token carries one.
+
+    Read from the signature-verified payload, never from a header a client could
+    set: a spoofable device id would make a personal promo code redeemable by
+    anyone who guessed the id. A caller with no token has no identity yet, which
+    is fine — redeeming a code mints one (see `with_device`).
+    """
+    token = request.headers.get("X-WX-Token") or request.query_params.get("token")
+    return ent.verify_token(token).device
+
+
+def with_device(response: Response, device: str | None) -> Response:
+    """Attach the device id to a response that minted one."""
+    if device:
+        response.set_cookie(DEVICE_COOKIE, device, max_age=DEVICE_MAX_AGE_S,
+                            httponly=True, samesite="lax",
+                            secure=config.is_production())
+    return response
+
+
+def bearer_token(request: Request) -> str | None:
+    return request.headers.get("X-WX-Token") or request.query_params.get("token")
+
+
+def effective_entitlement(request: Request, check_subscription: bool = True) -> ent.Entitlement:
+    """The entitlement actually in force, from every source that grants PRO.
+
+    Composition, in one place so the two PRO endpoints cannot drift apart:
+
+    1. Verify the signed token. A forged or expired token yields `free` here; no
+       other branch can resurrect it.
+    2. If it names a subscription, ask Stripe (through a short cache) whether that
+       subscription is still live. This is what makes a cancelled or unpaid
+       subscription stop granting access before the 30-day token expires — the
+       hole that let an old HMAC token keep working after cancellation.
+    3. If the caller holds a promo window for their device id, extend PRO to the
+       later of the two ends.
+
+    Failure policy: a Stripe lookup that cannot complete does **not** grant access
+    on its own, and does **not** revoke it either. It falls back to the token's own
+    expiry, which is bounded at 30 days and was issued only after a verified
+    payment. Fail-closed here would mean a five-minute Stripe outage logs every
+    paying customer out; fail-open on *expiry* would never happen, because the
+    token still expires.
+    """
+    e = ent.verify_token(bearer_token(request))
+    if not e.is_pro:
+        return e
+
+    # What the token itself guarantees, before the subscription is consulted.
+    #
+    # For a passcode or a trial the token *is* the grant, so its expiry is the whole
+    # window. For a promo token it is not: the token carries a 30-day lifetime so it
+    # can be presented on later requests, while the window it unlocks is the
+    # redemption's `pro_until` in the database. Treating the token lifetime as the
+    # grant is how a 5-day code would have quietly granted 30 days.
+    #
+    # A subscription token is worse than either: its 30-day lifetime must never
+    # outlive the subscription, or cancelling would leave PRO running. So for a
+    # subscription token nothing is taken from the token itself — only from Stripe.
+    promo_source = e.source == "promo"
+    ends: list[int] = []
+    if not promo_source and not e.subscription_id:
+        if e.pro_until:
+            ends.append(int(e.pro_until))
+        if e.expires_at:
+            ends.append(int(e.expires_at))
+    notes: list[str] = []
+
+    if e.subscription_id and check_subscription:
+        access = bill.subscription_access(e.subscription_id)
+        status = access.get("status")
+        if access.get("status") == "unknown":
+            # Stripe was unreachable. Fall back to the verified token's own expiry,
+            # which is bounded at 30 days, and label the response so an operator can
+            # see that the check did not happen.
+            notes.append("subscription_unverified")
+            if e.expires_at:
+                ends.append(int(e.expires_at))
+            log.warning("subscription lookup failed for %s...: %s",
+                        str(e.subscription_id)[:12], access.get("error"))
+        elif access.get("active"):
+            if access.get("until"):
+                ends.append(int(access["until"]))
+            notes.append(f"subscription:{status}")
+        else:
+            # Stripe says this subscription grants nothing. Nothing is added. A promo
+            # may still be in force for the same device, so that is checked below
+            # rather than returning FREE immediately.
+            log.info("subscription %s... no longer grants PRO (%s)",
+                     str(e.subscription_id)[:12], access.get("reason"))
+            notes.append("subscription_inactive")
+
+    promo_until = None
+    try:
+        promo_until = promo.active_until(e.device)
+    except Exception as ex:
+        log.warning("promo lookup failed: %s", ex)
+    if promo_until:
+        ends.append(int(promo_until))
+        notes.append("promo")
+
+    if not ends:
+        # A promo token whose window has lapsed, or one with no device and no
+        # record behind it. Either way there is nothing keeping PRO alive.
+        return ent.Entitlement("free", ent.FREE_HOURS, None, "free",
+                               device=e.device,
+                               notes=tuple(notes) + ("no_active_grant",))
+
+    pro_until = max(ends)
+    if pro_until <= int(time.time()):
+        return ent.Entitlement("free", ent.FREE_HOURS, None, "free",
+                               device=e.device, notes=tuple(notes) + ("expired",))
+
+    source = e.source
+    if promo_until and promo_until >= pro_until and not promo_source:
+        # The promo is what is keeping PRO alive for a token that would otherwise
+        # have lapsed; say so, so the UI can name the right end date.
+        source = "promo"
+
+    return ent.Entitlement("pro", ent.PRO_HOURS, e.expires_at, source,
+                           e.subscription_id, e.device,
+                           pro_until=pro_until, notes=tuple(notes))
+
+
+def pro_hours_for(e: ent.Entitlement) -> int:
+    """Forecast window this entitlement unlocks. FREE=72, PRO=240, unchanged."""
+    return ent.PRO_HOURS if e.is_pro else ent.FREE_HOURS
+
+
+def require_pro(request: Request) -> ent.Entitlement:
+    """Raise 403 unless the caller has an active PRO entitlement."""
+    e = effective_entitlement(request)
+    if not e.is_pro:
+        raise HTTPException(403, "Η λειτουργία είναι διαθέσιμη στη συνδρομή PRO.")
+    return e
+
+
+def entitlement_payload(e: ent.Entitlement) -> dict:
+    """The `tier` block the UI reads, with the effective window made explicit."""
+    return {
+        "tier": e.tier, "is_pro": e.is_pro, "source": e.source,
+        "hours": pro_hours_for(e),
+        "free_hours": ent.FREE_HOURS, "pro_hours": ent.PRO_HOURS,
+        "expires_at": e.expires_at,
+        "pro_until": e.pro_until,
+        "pro_until_iso": (dt.datetime.fromtimestamp(e.pro_until, dt.timezone.utc)
+                          .strftime("%Y-%m-%d") if e.pro_until else None),
+        "notes": list(e.notes),
+        "manageable": bool(e.subscription_id),
+        "locked_hours": 0 if e.is_pro else ent.PRO_HOURS - pro_hours_for(e),
+    }
+
+
+# ---------------------------------------------------------------- single-flight
+#
+# Two users (or the same user's double click) asking for the same cold forecast
+# at the same moment used to run the whole GFS fetch twice: five parallel
+# requests to one new point took 13/27/39/51/64 s, serialized, because each did
+# its own ~160 NOMADS calls. This collapses them onto one.
+
+_BRIEF_INFLIGHT: dict[str, asyncio.Future] = {}
+_BRIEF_LOCK = asyncio.Lock()
+
+
+async def _single_flight(key: str, factory):
+    """Run `factory()` once per `key`; concurrent callers await the same result.
+
+    The result is *not* cached here — the underlying GRIB step cache already does
+    that, and caching the fully-rendered payload would serve stale numbers across
+    a model run boundary. This only deduplicates work that is in flight.
+    """
+    async with _BRIEF_LOCK:
+        fut = _BRIEF_INFLIGHT.get(key)
+        if fut is None:
+            fut = asyncio.get_running_loop().create_future()
+            _BRIEF_INFLIGHT[key] = fut
+            leader = True
+        else:
+            leader = False
+    if not leader:
+        return await asyncio.shield(fut)
+    try:
+        result = await factory()
+        if not fut.done():
+            fut.set_result(result)
+        return result
+    except BaseException as e:
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        async with _BRIEF_LOCK:
+            _BRIEF_INFLIGHT.pop(key, None)
+
+
+def _collect_coord(lat: float, lon: float) -> None:
+    """422 on a coordinate no model can answer for.
+
+    FastAPI's `Query(ge=,le=)` already rejects most of this, but the bounds are
+    restated here for calls that reach the handler with a NaN smuggled through a
+    float coercion, and so the error text is the same on every endpoint.
+    """
+    reason = config.coord_error(lat, lon)
+    if reason:
+        raise HTTPException(422, reason)
+
+
 # ---------------------------------------------------------------- routes
 
 def redact_url(url: str) -> str:
@@ -2902,9 +3322,29 @@ async def health():
                       "models": grids.STORE.health()},
         # Payments: `checkout_available` must be true before the UI may offer a
         # payment button. `missing_config` names what is absent, without values.
+        # `webhook_configured` is reported separately from checkout availability
+        # because they fail independently: checkout works with no webhook secret,
+        # and a deploy that only sets the price ids would activate nothing.
         "billing": {"checkout_available": bill.checkout_available(),
                     "missing_config": bill.missing_config(),
+                    "webhook_configured": bool(bill.webhook_secret()),
                     "auto_renew_default": bill.AUTO_RENEW_BY_DEFAULT},
+        # Cache: size against the configured cap, and a count of damaged entries
+        # rejected on read since boot. `damaged > 0` is not an error — it means a
+        # truncated write was detected and regenerated rather than served.
+        "cache": _cache_health(),
+        # Promo codes: the tables are created lazily, so a failure here is a
+        # broken database rather than a missing feature.
+        "promo": promo.stats(),
+        # Entitlement signing: whether a real WX_SECRET is in force. Reported as a
+        # boolean only, never the value.
+        "auth": {"secret_configured": bool(os.environ.get("WX_SECRET")),
+                 "rate_limit_enabled": config.rate_limit_enabled(),
+                 "trust_proxy": config.trust_proxy_headers()},
+        # Analytics: on/off and the retention window. Reported so an operator can
+        # confirm at a glance that raw events are bounded, not accumulating.
+        "analytics": {"enabled": analytics.enabled(),
+                      "retention_days": analytics.retention_days()},
         "data_sources": ["GFS (public domain)", "ICON-EU DWD (CC BY 4.0)",
                          "ECMWF open data (CC BY 4.0, best-effort)",
                          "Photon geocoding (OSM)", "OpenTopoData DEM"],
@@ -2916,6 +3356,18 @@ async def health():
     }
 
 
+def _cache_health() -> dict:
+    try:
+        st = wx.cache_stats()
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:100]}"}
+    limit = st.get("limit_bytes")
+    over = bool(limit and st["bytes"] > limit)
+    return {"ok": not over, "bytes": st["bytes"], "limit_bytes": limit,
+            "files": st["files"], "oldest_age_s": st["oldest_age_s"],
+            "near_limit": bool(limit and st["bytes"] > 0.9 * limit)}
+
+
 @app.get("/api/elevation")
 async def elevation(lat: float, lon: float):
     """Point elevation (DEM) plus the model cell's mean elevation.
@@ -2924,6 +3376,7 @@ async def elevation(lat: float, lon: float):
     is for. Returning both means the user can see how much the grid cell is
     misrepresenting their location.
     """
+    _collect_coord(lat, lon)
     date, hh = wx.latest_gfs_run()
     async with httpx.AsyncClient(headers=wx.UA, timeout=40) as c:
         dem, orog = await asyncio.gather(
@@ -3014,6 +3467,7 @@ async def resolve(q: str = Query(min_length=2, max_length=80),
 
 @app.get("/api/reverse")
 async def reverse(lat: float, lon: float):
+    _collect_coord(lat, lon)
     async with httpx.AsyncClient(headers=wx.UA, timeout=25) as c:
         return await wx.reverse_geocode(c, lat, lon)
 
@@ -3063,16 +3517,38 @@ async def brief(request: Request, lat: float, lon: float, station: str | None = 
     sampled at a few steps for the model-comparison grid, since each ICON-EU
     variable is a ~1 MB whole-of-Europe download. ECMWF is attempted but is
     allowed to fail.
+
+    Validation order matters. The coordinate is checked *first*, before any
+    entitlement work and long before any fetch: `lat=999` used to reach NOMADS,
+    where an out-of-range sub-region is clamped to the whole planet, and a single
+    such request left a 419 MB file in the cache.
     """
+    _collect_coord(lat, lon)
     if elevation_m is not None and not (-50 <= elevation_m <= ELEVATION_LIMIT_M):
         raise HTTPException(422, f"elevation_m must be between -50 and {ELEVATION_LIMIT_M:.0f} m")
+    if hours is not None and not (config.HOURS_MIN <= hours <= config.HOURS_MAX):
+        raise HTTPException(422, f"hours must be between {config.HOURS_MIN} and {config.HOURS_MAX}")
+    if station is not None and not (1 <= len(station) <= 64):
+        raise HTTPException(422, "station must be 1-64 characters")
 
-    token = request.headers.get("X-WX-Token") or request.query_params.get("token")
-    entl = ent.verify_token(token)
+    entl = effective_entitlement(request)
     # PRO gets 10 days, free is capped at 72 h regardless of what was asked for.
-    allowed_hours = ent.PRO_HOURS if entl.is_pro else ent.FREE_HOURS
+    # `hours` was already bounded above by HOURS_MAX, and is bounded here by the
+    # entitlement, so an oversized request can never exceed the caller's tier.
+    allowed_hours = pro_hours_for(entl)
     hours = min(hours or allowed_hours, allowed_hours)
 
+    # Identical concurrent requests share one run. The key deliberately excludes
+    # the token: two free users asking for the same point want the same numbers,
+    # and the tier is already folded into `hours`.
+    flight_key = (f"brief|{lat:.3f},{lon:.3f}|{hours}|{elevation_m}|{station}")
+    return await _single_flight(
+        flight_key, lambda: _build_brief(request, lat, lon, station, hours, elevation_m, entl))
+
+
+async def _build_brief(request: Request, lat: float, lon: float, station: str | None,
+                       hours: int, elevation_m: float | None, entl: ent.Entitlement):
+    """Everything `/api/brief` does after validation. Split out for single-flight."""
     icon_steps = [0, 6, 12, 18, 24, 48] if entl.is_pro else []
 
     # When the RAM path is enabled and a grid is loaded, the GFS series and the
@@ -3228,11 +3704,13 @@ async def brief(request: Request, lat: float, lon: float, station: str | None = 
                   "unlocks": ent.plan_payload()["unlocks"]}
 
     out["expert"] = expert
-    out["tier"] = {"tier": entl.tier, "is_pro": entl.is_pro, "source": entl.source,
-                   "hours": hours, "free_hours": ent.FREE_HOURS, "pro_hours": ent.PRO_HOURS,
-                   "locked_hours": 0 if entl.is_pro else ent.PRO_HOURS - hours,
-                   "plans": ent.plan_payload()}
-    return out
+    tier_block = entitlement_payload(entl)
+    tier_block["hours"] = hours
+    tier_block["plans"] = ent.plan_payload()
+    # Short-lived: the payload depends on the caller's entitlement and on the
+    # model run, neither of which should be pinned for a browser cache.
+    out["tier"] = tier_block
+    return JSONResponse(out, headers={"Cache-Control": "private, max-age=300"})
 
 
 def temperature_series_for_agreement(gfs_rows: list[dict], icon: dict, ec: dict) -> dict[str, list]:
@@ -3492,6 +3970,7 @@ async def verify_endpoint(lat: float, lon: float, days: int = Query(4, ge=1, le=
     up. It is also expensive (one ERA5 chunk per hour plus one GFS range request
     per lead), so it is cached aggressively for a day.
     """
+    _collect_coord(lat, lon)
     key = f"verify-api|{lat:.2f},{lon:.2f}|{days}"
     blob = wx.cache_get(key, ttl=24 * 3600)
     if blob is not None:
@@ -3513,6 +3992,7 @@ async def sky(lat: float, lon: float, elev: float | None = None):
     worth returning to, and it depends on nothing we pay for per call. It is a
     pure calculation, so a burst of traffic costs CPU and no quota.
     """
+    _collect_coord(lat, lon)
     try:
         return astro.sky_now(lat, lon, elev)
     except Exception as e:
@@ -3534,12 +4014,17 @@ async def expert(request: Request, lat: float, lon: float, day: int = 0, hour: i
     step the GFS run genuinely publishes (hourly to +120 h, then every 3 h).
     Requesting f019 on a run that only has f018 is the bug this avoids.
     """
-    token = request.headers.get("X-WX-Token") or request.query_params.get("token")
-    e = ent.verify_token(token)
-    if not e.is_pro:
-        raise HTTPException(403, "Τα εξειδικευμένα δεδομένα είναι διαθέσιμα στη συνδρομή PRO.")
+    _collect_coord(lat, lon)
+    e = require_pro(request)
 
-    raw = max(0, day) * 24 + max(0, min(hour, 23))
+    # `day` and `hour` come from select controls, but a hand-rolled request can
+    # send anything. Bounding them here keeps the step arithmetic in range.
+    if not (0 <= day <= 11):
+        raise HTTPException(422, "day must be between 0 and 11")
+    if not (0 <= hour <= 23):
+        raise HTTPException(422, "hour must be between 0 and 23")
+
+    raw = day * 24 + hour
     step = nearest_gfs_step(raw, e.hours)
 
     async with httpx.AsyncClient(headers=wx.UA, timeout=120) as c:
@@ -3562,9 +4047,11 @@ async def expert(request: Request, lat: float, lon: float, day: int = 0, hour: i
 
 @app.get("/api/skewt")
 async def skewt(request: Request, lat: float, lon: float, step: int = 12):
-    token = request.headers.get("X-WX-Token") or request.query_params.get("token")
-    if not ent.verify_token(token).is_pro:
-        raise HTTPException(403, "Το Skew-T είναι διαθέσιμο στη συνδρομή PRO.")
+    _collect_coord(lat, lon)
+    e = require_pro(request)
+    if not (0 <= step <= ent.PRO_HOURS):
+        raise HTTPException(422, f"step must be between 0 and {ent.PRO_HOURS}")
+    step = nearest_gfs_step(step, e.hours)
     async with httpx.AsyncClient(headers=wx.UA, timeout=120) as c:
         try:
             ds = await wx.gfs_profile_dataset(c, lat, lon, step)
@@ -3614,10 +4101,27 @@ async def auth_trial():
 
 @app.get("/api/me")
 async def me(request: Request):
-    token = request.headers.get("X-WX-Token") or request.query_params.get("token")
-    e = ent.verify_token(token)
-    return {"tier": e.tier, "is_pro": e.is_pro, "source": e.source, "hours": e.hours,
-            "expires_at": e.expires_at, "manageable": bool(e.subscription_id)}
+    """What this caller is entitled to right now.
+
+    Uses the composed entitlement, not the bare token: a token whose subscription
+    was cancelled must report FREE here, because this endpoint is what the UI
+    trusts to decide whether to show the PRO badge.
+    """
+    e = effective_entitlement(request)
+    payload = entitlement_payload(e)
+    payload["redemptions"] = promo_redemptions_for(e.device)
+    return payload
+
+
+def promo_redemptions_for(device: str | None) -> list[dict]:
+    """The caller's own promo windows, for "PRO activated until <date>"."""
+    if not device:
+        return []
+    try:
+        return [{"code": r["code"], "pro_until": r["pro_until"]}
+                for r in promo.subject_redemptions(device)]
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------- billing (Stripe)
@@ -3702,9 +4206,12 @@ async def set_auto_renew(request: Request):
     payload = await request.json()
     enabled = bool(payload.get("enabled"))
     try:
-        return bill.set_auto_renew(e.subscription_id, enabled)
+        result = bill.set_auto_renew(e.subscription_id, enabled)
     except Exception as ex:
         raise HTTPException(502, f"Stripe: {type(ex).__name__}: {str(ex)[:160]}")
+    # The cached state is now wrong by construction; the user just changed it.
+    bill.cache_forget(e.subscription_id)
+    return result
 
 
 @app.post("/api/stripe/webhook")
@@ -3728,15 +4235,38 @@ async def stripe_webhook(request: Request):
 
     etype = event["type"]
     obj = event["data"]["object"]
-    if etype in ("checkout.session.completed", "customer.subscription.created"):
-        sub_id = obj.get("subscription") or obj.get("id")
-        meta = obj.get("metadata") or (obj.get("subscription_details") or {}).get("metadata") or {}
-        wx = meta.get("wx_token")
-        if sub_id and wx:
-            # Re-issue with the subscription id attached, so the same browser
-            # that started the checkout can manage what it bought.
+    log.info("stripe webhook: type=%s id=%s", etype, obj.get("id"))
+
+    # Every lifecycle event invalidates whatever we cached for that subscription.
+    # The webhook is Stripe telling us the state changed, so continuing to serve a
+    # cached "active" after `customer.subscription.deleted` would be a bug we were
+    # explicitly warned about.
+    sub_id = obj.get("id") if etype.startswith("customer.subscription") else obj.get("subscription")
+    if sub_id:
+        bill.cache_forget(sub_id)
+
+    if etype == "checkout.session.completed":
+        # The buyer needs their token on return; the webhook is the server-to-server
+        # signal that the payment landed. Attach the subscription id so it is manageable.
+        sub = obj.get("subscription")
+        sub = sub.get("id") if isinstance(sub, dict) else sub
+        meta = obj.get("metadata") or {}
+        if sub and meta.get("wx_token"):
             return {"ok": True, "token": ent.issue_token("pro", "subscription",
-                                                         subscription_id=sub_id)}
+                                                         subscription_id=sub)}
+        return {"ok": True, "note": "payment recorded; claim endpoint issues the token"}
+
+    if etype == "invoice.payment_failed":
+        # Access is deliberately *not* revoked here. Stripe retries for several
+        # days and `customer.subscription.updated` will carry `past_due`, which
+        # `subscription_access` still admits. What this does is make the failure
+        # visible and drop the cache so the next request sees the retry state.
+        log.warning("invoice payment failed: customer=%s subscription=%s",
+                    obj.get("customer"), obj.get("subscription"))
+
+    if etype == "customer.subscription.deleted":
+        log.info("subscription deleted: %s", sub_id)
+
     return {"ok": True, "ignored": etype}
 
 
@@ -3809,3 +4339,226 @@ async def station_status(station_id: str):
 
 
 bias.init_db()
+
+
+# ---------------------------------------------------------------- promo codes (public)
+
+@app.post("/api/promo/redeem")
+async def promo_redeem(request: Request):
+    """Redeem a code for the calling device.
+
+    The identity is the opaque device id carried in the caller's signed token.
+    A caller with no token is issued one here — that is the moment a device
+    becomes identifiable to this service, and it is why the response sets an
+    httpOnly cookie as well as returning a token.
+
+    Everything that decides whether the code is acceptable happens in
+    `promo.redeem`, inside one SQLite transaction: a second request racing for
+    the last remaining use cannot also succeed. Nothing about "is this caller
+    PRO" is decided in the browser.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
+    code = str(payload.get("code", ""))
+    caller = ent.verify_token(bearer_token(request))
+    dev = caller.device
+    minted = False
+    if not dev:
+        dev = secrets.token_hex(16)
+        minted = True
+    try:
+        result = promo.redeem(code, dev, source="web")
+    except promo.RedemptionError as e:
+        # A refused attempt is still a redemption outcome worth counting; the
+        # reason stays in meta so failures are separable from successes.
+        analytics.track("promo_code_redeemed", request=request, device=dev,
+                        meta={"ok": False, "reason": e.code})
+        log.info("promo redeem refused: reason=%s", e.code)
+        raise HTTPException(e.http_status, e.message)
+
+    # A fresh PRO token carrying the device id, so the entitlement is checked
+    # server-side on every later request rather than trusted from the client.
+    #
+    # A subscription id already in the caller's token is carried forward, so a
+    # subscriber who redeems a gift code gets one token that unlocks both. Without
+    # this the redemption would bind to a device the subscription token does not
+    # have, and the paid subscriber would see no promo at all.
+    token = ent.issue_token("pro", "promo", ttl=ent.TOKEN_TTL_S, device=dev,
+                            subscription_id=caller.subscription_id)
+    analytics.track("promo_code_redeemed", request=request, device=dev,
+                    value=result["days"], meta={"ok": True, "code": result["code"][:16]})
+    log.info("promo redeemed: code=%s days=%d", result["code"], result["days"])
+    body = {
+        "ok": True,
+        "token": token,
+        "code": result["code"],
+        "days": result["days"],
+        "pro_until": result["pro_until"],
+        "pro_until_iso": result["pro_until_iso"],
+        "message": f"Το PRO ενεργοποιήθηκε έως {result['pro_until_iso'][:10]}.",
+    }
+    resp = JSONResponse(body)
+    if minted:
+        with_device(resp, dev)
+    return resp
+
+
+@app.get("/api/promo/status")
+async def promo_status(request: Request):
+    """Whether this caller holds a promo window, for the small UI line.
+
+    Also returns the caller's own device id. It is the identifier an operator
+    needs to issue a personal gift code (`restricted_to`), and it is only ever
+    the caller's own value — it is never looked up from anyone else's request.
+    """
+    dev = device_id(request)
+    until = None
+    try:
+        until = promo.active_until(dev)
+    except Exception:
+        pass
+    reds = promo_redemptions_for(dev)
+    return {"active": bool(until),
+            "pro_until": until,
+            "pro_until_iso": (dt.datetime.fromtimestamp(until, dt.timezone.utc)
+                              .strftime("%Y-%m-%d") if until else None),
+            "device": dev,
+            "codes": sorted({r["code"] for r in reds})}
+
+
+# ---------------------------------------------------------------- promo admin
+
+ADMIN_HEADER = "X-WX-Admin"
+
+
+def require_admin(request: Request) -> None:
+    """Gate the admin endpoints on a separate operator token.
+
+    Deliberately a *different* secret from `WX_SECRET`: the signing key is used on
+    every request path, while this one is only compared here. If it is unset the
+    admin surface is closed rather than open — an unconfigured deploy must not
+    expose code creation to the internet.
+
+    Compared with `hmac.compare_digest`, and never logged.
+    """
+    configured = (os.environ.get("WX_ADMIN_TOKEN") or "").strip()
+    if not configured:
+        raise HTTPException(503, "Το admin API δεν είναι ρυθμισμένο (WX_ADMIN_TOKEN).")
+    presented = request.headers.get(ADMIN_HEADER) or ""
+    if not hmac.compare_digest(presented.encode(), configured.encode()):
+        log.warning("admin auth failed from %s",
+                    ratelimit.client_key(request, config.trust_proxy_headers())[:12])
+        raise HTTPException(403, "Μη εξουσιοδοτημένη πρόσβαση.")
+
+
+@app.post("/api/admin/promo")
+async def admin_promo_create(request: Request):
+    """Create or update a code. Nothing here needs a code change or a redeploy."""
+    require_admin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
+    try:
+        row = promo.create_code(
+            code=str(payload.get("code", "")),
+            duration_days=payload.get("duration_days"),
+            created_by=str(payload.get("created_by") or "admin")[:64],
+            note=str(payload.get("note") or "")[:280] or None,
+            max_redemptions=payload.get("max_redemptions"),
+            active=bool(payload.get("active", True)),
+            starts_at=payload.get("starts_at"),
+            expires_at=payload.get("expires_at"),
+            restricted_to=payload.get("restricted_to") or payload.get("intended_subject"),
+            is_gift=bool(payload.get("is_gift", False)),
+        )
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return {"created": True, "code": row}
+
+
+@app.get("/api/admin/promo")
+async def admin_promo_list(request: Request, include_inactive: bool = True):
+    """Codes with their use counts. No personal data beyond a truncated subject."""
+    require_admin(request)
+    codes = promo.list_codes(include_inactive=include_inactive)
+    for c in codes:
+        rs = promo.redemptions(c["code"], limit=50)
+        c["recent_redemptions"] = [
+            {"subject": (r["subject"] or "")[:8] + ("…" if r["subject"] else ""),
+             "redeemed_at": r["redeemed_at"], "pro_until": r["pro_until"]}
+            for r in rs]
+    return {"codes": codes, "stats": promo.stats()}
+
+
+@app.post("/api/admin/promo/{code}/active")
+async def admin_promo_set_active(code: str, request: Request):
+    """Revoke or restore a code."""
+    require_admin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
+    ok = promo.set_active(code, bool(payload.get("active")))
+    if not ok:
+        raise HTTPException(404, "Ο κωδικός δεν υπάρχει.")
+    return {"code": promo.normalize(code), "active": bool(payload.get("active"))}
+
+
+@app.get("/api/admin/analytics")
+async def admin_analytics(request: Request, days: int = Query(30, ge=1, le=365)):
+    require_admin(request)
+    return analytics.summary(days=days)
+
+
+# ---------------------------------------------------------------- analytics ingest
+
+@app.post("/api/analytics")
+async def analytics_ingest(request: Request):
+    """Record a batch of events from the page.
+
+    Bounded on both axes: at most 25 events per call, and each event name must be
+    in the closed vocabulary. A visitor cannot create a new event dimension, and
+    a client cannot use this as a way to write unbounded rows. Coordinates, when
+    present, are reduced to a coarse cell inside `analytics.track` and the exact
+    point is never stored.
+    """
+    if not analytics.enabled():
+        return {"ok": True, "recorded": 0, "enabled": False}
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
+    events = body.get("events") if isinstance(body, dict) else None
+    if not isinstance(events, list):
+        raise HTTPException(400, "Το πεδίο 'events' πρέπει να είναι λίστα.")
+    if len(events) > 25:
+        raise HTTPException(413, "Πολλά events σε ένα αίτημα (όριο 25).")
+    dev = device_id(request)
+    recorded = 0
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        name = str(ev.get("name", ""))
+        lat = ev.get("lat") if isinstance(ev.get("lat"), (int, float)) else None
+        lon = ev.get("lon") if isinstance(ev.get("lon"), (int, float)) else None
+        meta = ev.get("meta") if isinstance(ev.get("meta"), dict) else None
+        value = ev.get("value") if isinstance(ev.get("value"), (int, float)) else None
+        if analytics.track(name, request=request, device=dev, lat=lat, lon=lon,
+                           value=value, meta=meta):
+            recorded += 1
+    if recorded:
+        # Opportunistic tidy, throttled to once an hour inside `maybe_prune`.
+        analytics.maybe_prune()
+    # The response is deliberately empty of detail: this endpoint is not a way to
+    # probe which event names exist.
+    return {"ok": True, "recorded": recorded}
+
+
+analytics.init_db()

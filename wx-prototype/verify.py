@@ -31,7 +31,7 @@ import time
 import httpx
 import numpy as np
 
-from wx import CACHE_DIR, UA, cache_get, cache_put
+from wx import UA, cache_dir, cache_get, cache_put
 
 # ARCHIVE_BASE is the AWS Open Data mirror of the same NOAA GFS product that
 # NOMADS serves, kept because NOMADS only retains a few cycles.
@@ -270,7 +270,7 @@ def _decode_grib_point(blob: bytes, var: str):
     data variable is taken positionally rather than by name.
     """
     import xarray as xr
-    path = os.path.join(CACHE_DIR, f"verify-{os.getpid()}-{hashlib.md5(blob[:512]).hexdigest()[:8]}.grib2")
+    path = os.path.join(cache_dir(), f"verify-{os.getpid()}-{hashlib.md5(blob[:512]).hexdigest()[:8]}.grib2")
     with open(path, "wb") as f:
         f.write(blob)
     try:
