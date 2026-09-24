@@ -34,7 +34,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 
-DB_PATH = os.environ.get("WX_DB", "/tmp/wx-cache/station.db")
+import config
 
 # --- tuning knobs, all deliberate ---
 MIN_PAIRS = 4          # need at least this many obs/forecast pairs
@@ -44,10 +44,23 @@ CORRECTION_HOURS = 6   # only the first N hours get corrected
 IMPLAUSIBLE_C = (-60.0, 60.0)
 
 
+def db_path() -> str:
+    """The station database, resolved on every call.
+
+    Deliberately not a module constant: `app.py` imports this module *before*
+    `envfile.load()`, so a value read at import time would freeze the pre-.env
+    environment and silently point at a different file than `config.db_path()`
+    and every other module. Delegating keeps one authoritative answer even when
+    the process is configured by a `.env` rather than by the real environment.
+    """
+    return config.db_path()
+
+
 @contextmanager
 def _db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    con = sqlite3.connect(DB_PATH, timeout=15)
+    path = db_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    con = sqlite3.connect(path, timeout=15)
     con.row_factory = sqlite3.Row
     try:
         con.execute("PRAGMA journal_mode=WAL")
@@ -237,4 +250,4 @@ def recent_obs(station_id: str, limit: int = 24) -> list[dict]:
 
 if __name__ == "__main__":
     init_db()
-    print("station db initialised at", DB_PATH)
+    print("station db initialised at", db_path())
