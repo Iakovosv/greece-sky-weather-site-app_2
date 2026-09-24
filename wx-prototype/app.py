@@ -304,10 +304,14 @@ async def _notify_prime(subs: list[dict]) -> dict:
 def _normalize_hours(rows: list[dict]) -> list[dict]:
     """Shapes either source's rows into what `notify.evaluate` reads.
 
-    Both the RAM grid rows and the per-point rows carry `t2m_c` in Kelvin while
-    `evaluate` works in Celsius, so the conversion happens once here rather than
-    in the rule code. `feels` is computed with the same `apparent_temp` the UI
-    uses, so an alert and the forecast cannot disagree about the number.
+    Both sources already hand over `t2m_c` in **Celsius**: the per-point path
+    converts at decode time (`wx.gfs_surface_step`) and the shared grid does the
+    same when it is built (`scheduler.build_gfs`). Subtracting 273.15 here a
+    second time turned an ordinary 25 °C afternoon into -248 °C, which tripped
+    the cold rule and left the heat rule unreachable. The value is therefore
+    passed through unchanged. `feels` is computed with the same `apparent_temp`
+    the UI uses, which also takes Celsius, so an alert and the forecast cannot
+    disagree about the number.
     """
     out = []
     for r in rows:
@@ -315,7 +319,7 @@ def _normalize_hours(rows: list[dict]) -> list[dict]:
         if step is None:
             continue
         raw_t = r.get("t2m_c")
-        t = None if raw_t is None else raw_t - 273.15
+        t = None if raw_t is None else raw_t
         wind = r.get("wind_kmh")
         rh = r.get("rh2_pct")
         out.append({
