@@ -1024,9 +1024,9 @@ button.primary:hover{filter:brightness(1.08)}
   <section id="panel-why" class="panel">
     <div class="hero">
       <div class="eyebrow">Greece Sky and Weather</div>
-      <h2>Γιατί να επιλέξετε το Greece Sky and Weather;</h2>
+      <h2>Γιατί να διαλέξεις το Greece Sky and Weather;</h2>
       <p>Οι κοινές υπηρεσίες δίνουν μία μέση τιμή για ολόκληρη την περιοχή. Εμείς
-        υπολογίζουμε την πρόγνωση ειδικά για το σημείο σας — με το πραγματικό του
+        υπολογίζουμε την πρόγνωση ειδικά για το σημείο σου — με το πραγματικό του
         υψόμετρο, με τη σύγκριση τριών μοντέλων και με πλήρη ραδιοβόλιση για την
         πρόγνωση έντονων φαινομένων.</p>
     </div>
@@ -1036,7 +1036,7 @@ button.primary:hover{filter:brightness(1.08)}
         <div class="ic">⛰️</div>
         <h3>Διόρθωση θερμοκρασίας με πραγματικό υψόμετρο</h3>
         <p>Δυναμική προσαρμογή με βαθμίδα θερμοκρασίας υπολογισμένη από το προφίλ
-          του μοντέλου και το ακριβές υψόμετρο του σημείου σας — από GPS,
+          του μοντέλου και το ακριβές υψόμετρο του σημείου σου — από GPS,
           συντεταγμένες ή χειροκίνητα.</p>
         <span class="tag">Lapse rate από το sounding</span>
       </div>
@@ -1044,7 +1044,7 @@ button.primary:hover{filter:brightness(1.08)}
         <div class="ic">🛰️</div>
         <h3>Συμφωνία 3 μοντέλων (GFS, ECMWF, ICON)</h3>
         <p>Σύγκριση των κορυφαίων μοντέλων δίπλα-δίπλα. Όταν συμφωνούν, υπάρχει
-          ομοφωνία μεταξύ τους· όταν αποκλίνουν, το βλέπετε αμέσως. Είναι ένδειξη
+          ομοφωνία μεταξύ τους· όταν αποκλίνουν, το βλέπεις αμέσως. Είναι ένδειξη
           συμφωνίας, όχι εγγύηση ότι η πρόγνωση θα επαληθευτεί.</p>
         <span class="tag">Ένδειξη συμφωνίας μοντέλων</span>
       </div>
@@ -1107,7 +1107,7 @@ button.primary:hover{filter:brightness(1.08)}
 <div class="modal" id="promodal" onclick="if(event.target===this)closeModal()">
   <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="pm-title">
     <h3 id="pm-title">Αναβάθμιση σε PRO</h3>
-    <div class="sub" id="pm-sub">Ξεκλείδωσε 10 ημέρες πρόγνωση, Skew-T, δείκτες αστάθειας και σύγκριση 3 μοντέλων.</div>
+    <div class="sub" id="pm-sub">Ξεκλείδωσε πρόγνωση 10 ημερών — δωρεάν οι πρώτες 3 — με Skew-T, δείκτες αστάθειας και σύγκριση 3 μοντέλων.</div>
 
     <div class="plan sel" id="plan-yearly" onclick="pickPlan('yearly')">
       <div class="best">Best Value — Έκπτωση <span id="disc">44.3</span>%</div>
@@ -1313,7 +1313,10 @@ function renderCta(){
       +'</div>'
       +'<div class="go"><button class="primary" onclick="ctaGo()" id="cta-go">Ξεκίνα δωρεάν δοκιμή '
         +PLANS.trial_days+' ημερών</button>'
-        +'<button onclick="openModal()">Δες όλα τα πλάνα</button></div>')
+        +'<button onclick="openModal()">Δες όλα τα πλάνα</button></div>'
+      +'<p class="leadsub">Έχεις κωδικό PRO ή δωροκάρτα; '
+        +'<a href="#" onclick="openModal();return false">Εξαργύρωσέ τον εδώ</a></p>'
+      +'<div class="msg" id="cta-msg"></div>')
     +'<div class="fineprint">'+(PLANS.checkout_available
       ? 'Η πληρωμή γίνεται με ασφάλεια μέσω Stripe. Δεν βλέπουμε στοιχεία κάρτας.'
       : 'Η πληρωμή δεν είναι διαθέσιμη αυτή τη στιγμή.')
@@ -1359,7 +1362,16 @@ async function startTrial(){
     else { renderCta(); }
   }catch(e){
     if(go){ go.disabled=false; go.textContent='Ξεκίνα δωρεάν δοκιμή'; }
-    alert('Σφάλμα: '+e.message);
+    uiMsg('Σφάλμα: '+e.message,false);   // in place, never a browser alert
+  }
+}
+/* Inline message for the trial/checkout flow. Written to the modal's own line and
+   to the why-tab CTA line, so the failure lands inside whichever surface the
+   visitor is looking at instead of a browser alert that steals the whole tab. */
+function uiMsg(text, ok){
+  for(const id of ['pm-msg','cta-msg']){
+    const m=document.getElementById(id); if(!m) continue;
+    m.className='msg '+(ok?'ok':'err'); m.textContent=text;
   }
 }
 function pickPlan(p){
@@ -1393,7 +1405,12 @@ function fillPlans(){
   document.getElementById('pm-unlocks').innerHTML=
     PLANS.unlocks.map(u=>'<li>'+u+'</li>').join('');
   document.getElementById('pm-sub').textContent=
-    'Ξεκλείδωσε '+PLANS.pro_display+' πρόγνωση, Skew-T, δείκτες αστάθειας και σύγκριση 3 μοντέλων.';
+    'Ξεκλείδωσε πρόγνωση '+PLANS.pro_hours/24+' ημερών — δωρεάν οι πρώτες '
+    +PLANS.free_hours/24+' — με Skew-T, δείκτες αστάθειας και σύγκριση 3 μοντέλων.';
+  // The modal title must describe what the visitor can actually do here. A PRO
+  // visitor opening it from "Διαχείριση συνδρομής" must not be told to upgrade.
+  document.getElementById('pm-title').textContent=
+    TIER.is_pro?'Διαχείριση PRO':'Αναβάθμιση σε PRO';
   document.getElementById('pm-trial-days').textContent=PLANS.trial_days;
   // already PRO: a trial button would just be noise
   document.getElementById('pm-trial').style.display=TIER.is_pro?'none':'';
@@ -1840,9 +1857,10 @@ function signOut(){
   // The token is the only thing that grants PRO on this device, and a promo code
   // cannot be redeemed twice, so this is not a reversible "log out". Say so
   // plainly rather than letting a single click drop paid-for access.
-  const msg='Η αποσύνδεση αφαιρεί το PRO από αυτή τη συσκευή. '
-    +'Η συνδρομή σου ΔΕΝ ακυρώνεται, αλλά η επαναφορά της πρόσβασης μπορεί να '
-    +'χρειάζεται νέα ενεργοποίηση. Θέλεις να συνεχίσεις;';
+  const msg='Η αφαίρεση βγάζει το PRO από αυτή τη συσκευή: θα ξαναδείς μόνο τη '
+    +'δωρεάν πρόγνωση και θα χρειαστεί νέος κωδικός ή νέα ενεργοποίηση για να το '
+    +'πάρεις πίσω. Η συνδρομή σου στη Stripe ΔΕΝ ακυρώνεται και δεν σταματά η '
+    +'χρέωση. Θέλεις να συνεχίσεις;';
   if(!window.confirm(msg)) return;
   TOKEN=null; localStorage.removeItem('wx_token');
   const pl=document.getElementById('pm-promoline'); if(pl) pl.hidden=true;
@@ -1860,10 +1878,10 @@ async function reload(){ if(CUR) load(CUR.lat,CUR.lon,CUR.label,{elevation_m:CUR
 function renderTierBar(t, containerId){
   const el=document.getElementById(containerId); if(!el) return;
   const pro=t.is_pro;
-  const src=pro?({passcode:'κωδικός',subscription:'συνδρομή',trial:'δωρεάν δοκιμή',free:''}[t.source]||t.source):'';
+  const src=pro?({passcode:'κωδικός πρόσβασης',subscription:'συνδρομή Stripe',trial:'δωρεάν δοκιμή',free:''}[t.source]||t.source):'';
   el.innerHTML='<span class="pill '+(pro?'pro':'free')+'">'+(pro?'PRO':'FREE')+'</span>'
     +'<span>'+(pro
-        ? 'Ξεκλειδωμένες '+PLANS_HOURS(t.pro_hours)+'. Πηγή ενεργοποίησης: '+src+'.'
+        ? 'Ξεκλειδωμένες '+PLANS_HOURS(t.pro_hours)+'. Πηγή πρόσβασης: '+src+'.'
         : 'Δωρεάν πρόγνωση '+PLANS_HOURS(t.free_hours)+'. Κλειδωμένες οι επόμενες '
           +PLANS_HOURS(t.locked_hours)+'.')
     +'</span>';
@@ -1871,7 +1889,7 @@ function renderTierBar(t, containerId){
   // A subscription token cannot be re-issued from the browser: the only way back
   // is a fresh Checkout Session, so there is no sign-out button for it. Removing
   // one's own PRO by accident must not be a single click away.
-  else if(t.source!=='subscription') el.innerHTML+='<button onclick="signOut()" style="margin-left:auto">Έξοδος από PRO</button>';
+  else if(t.source!=='subscription') el.innerHTML+='<button onclick="signOut()" style="margin-left:auto">Αφαίρεση PRO από τη συσκευή</button>';
 }
 function PLANS_HOURS(hours){ return hours>=24 ? (hours/24)+' ημέρες ('+hours+' ώρες)' : hours+' ώρες'; }
 
@@ -2118,10 +2136,10 @@ function renderSimple(d){
   // --- manual elevation control -------------------------------------------
   let elevPanel = '<details class="geo"><summary>⛰️ Υψόμετρο &amp; Τοπική Θερμοκρασία</summary>'
     +'<div class="body">'
-    +'<p>Η θερμοκρασία που βλέπετε προσαρμόζεται στο ακριβές υψόμετρο της τοποθεσίας '
-    +'σας. Σε αντίθεση με τα κοινά sites που δίνουν μια γενική μέση τιμή για όλη την '
+    +'<p>Η θερμοκρασία που βλέπεις προσαρμόζεται στο ακριβές υψόμετρο της τοποθεσίας '
+    +'σου. Σε αντίθεση με τα κοινά sites που δίνουν μια γενική μέση τιμή για όλη την '
     +'περιοχή, το Greece Sky and Weather υπολογίζει τη θερμοκρασία, την αίσθηση και τη '
-    +'βάση των νεφών ειδικά για το δικό σας υψόμετρο.</p>'
+    +'βάση των νεφών ειδικά για το δικό σου υψόμετρο.</p>'
     +'<label>Υψόμετρο σημείου (m) — επεξεργάσιμο</label>'
     +'<input id="inp-elev" type="number" step="1" min="-50" max="3000" '
       +'value="'+((el.manual_elevation!=null)?el.manual_elevation
@@ -2306,7 +2324,8 @@ function lockedDayCard(day, label){
 function dailyCarousel(daily){
   const isPro=(TIER&&TIER.is_pro)||false;
   if(!daily||!daily.length) return '';
-  let h='<h3>Πρόγνωση 10 ημερών</h3>'
+  let h='<h3>'+(isPro?'Πρόγνωση 10 ημερών'
+      :'Πρόγνωση 10 ημερών — δωρεάν οι πρώτες '+daily.length)+'</h3>'
     +'<div class="dstrip" id="dstrip" role="list" aria-label="Ημερήσια πρόγνωση">';
   for(const r of daily) h+=dayCard(r);
   if(!isPro){
@@ -3068,8 +3087,10 @@ async function claimCheckout(sessionId){
     openModal();
   }catch(e){
     history.replaceState({},'',location.pathname);
-    alert('Η πληρωμή ολοκληρώθηκε, αλλά η ενεργοποίηση απέτυχε: '+e.message
-      +' Στείλε το αναγνωριστικό συναλλαγής στο υποστήριξη.');
+    // Error inside the modal the caller is about to land on, not a browser alert.
+    openModal();
+    uiMsg('Η πληρωμή ολοκληρώθηκε, αλλά η ενεργοποίηση απέτυχε: '+e.message
+      +' Στείλε το αναγνωριστικό συναλλαγής στην υποστήριξη.',false);
   }
 }
 

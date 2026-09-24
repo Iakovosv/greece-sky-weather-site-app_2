@@ -188,6 +188,6 @@ def plan_payload() -> dict:
             "trial_days": PRICING["trial"]["days"], "trial_hours": TRIAL_HOURS,
             "free_display": "72 ώρες (3 ημέρες)", "pro_display": "10 ημέρες",
             "pro_locked_days": "Ημέρες 4–10",
-            "unlocks": ["Πρόγνωση 10 ημερών", "Skew-T και κατακόρυφη δομή",
+            "unlocks": ["Πλήρης πρόγνωση 10 ημερών (δωρεάν οι πρώτες 3)", "Skew-T και κατακόρυφη δομή",
                         "Δείκτες αστάθειας (SBCAPE, Shear, SRH, LCL)",
                         "Σύγκριση 3 μοντέλων", "Διόρθωση με τοπικό σταθμό"]}
