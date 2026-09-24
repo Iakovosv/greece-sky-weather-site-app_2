@@ -382,6 +382,12 @@ async def icon_eu_point(client: httpx.AsyncClient, lat: float, lon: float,
 
 # ---------------------------------------------------------------- ECMWF (CC BY 4.0, best effort)
 
+# Published ECMWF open-data files are immutable once a run is out, so the TTL
+# only bounds how long a copy may linger on disk. Six hours matches ICON-EU and
+# is shorter than the run cadence, so a superseded run is never served for long.
+ECMWF_TTL_S = 6 * 3600
+
+
 async def ecmwf_point(client: httpx.AsyncClient, lat: float, lon: float,
                       step: int = 24, hh: str = "00") -> dict:
     """ECMWF open data via HTTP Range requests on the byte offsets in its .index.
@@ -389,30 +395,50 @@ async def ecmwf_point(client: httpx.AsyncClient, lat: float, lon: float,
     Best-effort by design: the servers rate-limit (HTTP 429) and have returned
     intermittent 404s for steps that do exist, so callers must degrade gracefully
     and must never treat this as the primary source.
+
+    Both upstream reads are cached, because without it every forecast re-fetched
+    the same one index plus five Range slices: the grib2 is fetched per parameter,
+    so a single point cost six GETs and a repeat request cost six more. That is
+    also what produced the 429s that drop the model comparison. The keys are
+    `stem`-based, not point-based: the Range slice is the whole field, so the
+    point is selected after decode and two users asking for the same run share
+    one download.
     """
     check_point(lat, lon)
     date = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=8)).strftime("%Y%m%d")
     stem = f"{ECMWF_OD}/{date}/{hh}z/ifs/0p25/oper/{date}{hh}0000-{step}h-oper-fc"
-    r = await client.get(f"{stem}.index")
-    r.raise_for_status()
-    rows = [json.loads(line) for line in r.content.decode().splitlines() if line.strip()]
+
+    index_key = f"ecmwf-index|{date}{hh}|{step}"
+    blob = cache_get(index_key, ttl=ECMWF_TTL_S)
+    if blob is None:
+        r = await client.get(f"{stem}.index")
+        r.raise_for_status()
+        blob = r.content
+        cache_put(index_key, blob)
+    rows = [json.loads(line) for line in blob.decode().splitlines() if line.strip()]
 
     out: dict = {}
     for row in rows:
         if row.get("levtype") != "sfc" or row.get("param") not in ("2t", "10u", "10v", "msl", "tp"):
             continue
-        start, length = row["_offset"], row["_length"]
-        rr = await client.get(f"{stem}.grib2",
-                              headers={**UA, "Range": f"bytes={start}-{start + length - 1}"})
-        rr.raise_for_status()
+        param = row["param"]
+        grib_key = f"ecmwf-grib|{date}{hh}|{step}|{param}"
+        grib = cache_get(grib_key, ttl=ECMWF_TTL_S)
+        if grib is None:
+            start, length = row["_offset"], row["_length"]
+            rr = await client.get(f"{stem}.grib2",
+                                  headers={**UA, "Range": f"bytes={start}-{start + length - 1}"})
+            rr.raise_for_status()
+            grib = rr.content
+            cache_put(grib_key, grib)
         path = os.path.join(cache_dir(), f"ec-{os.getpid()}-{row['param']}.grib2")
         with open(path, "wb") as f:
-            f.write(rr.content)
+            f.write(grib)
         try:
             ds = xr.open_dataset(path, engine="cfgrib", backend_kwargs={
-                "indexpath": "", "filter_by_keys": {"shortName": row["param"]}})
+                "indexpath": "", "filter_by_keys": {"shortName": param}})
             v = list(ds.data_vars)[0]
-            out[row["param"]] = float(ds[v].sel(latitude=lat, longitude=lon, method="nearest").values)
+            out[param] = float(ds[v].sel(latitude=lat, longitude=lon, method="nearest").values)
             ds.close()
         finally:
             try:
