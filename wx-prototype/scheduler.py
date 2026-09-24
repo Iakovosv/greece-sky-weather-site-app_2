@@ -346,21 +346,104 @@ async def build_icon(client: httpx.AsyncClient, bbox: dict | None = None) -> gri
                           steps=steps_ok, vars=cubes)
 
 
-async def refresh_once(store: grids.GridStore, builders: dict | None = None) -> dict:
+def _gfs_target_run() -> str:
+    """The GFS run id the next build would use, without building.
+
+    `latest_gfs_run` is memoized for `WX_RUN_LOOKUP_TTL_S` and probes real
+    availability, so asking it here is cheap and is the same answer the build
+    itself would resolve. That is what makes the short-circuit below honest: it
+    skips only when the *published* run is the one already loaded.
+    """
+    date, hh = wx.latest_gfs_run()
+    return f"{date}{hh}"
+
+
+def _icon_target_run() -> str:
+    return wx.icon_eu_latest_run()
+
+
+DEFAULT_BUILDERS = {"gfs": build_gfs,
+                    "icon": lambda c: build_icon(c, grids.icon_bbox())}
+# model -> (run resolver, scope resolver). Scope names the box so two
+# deployments with different ICON scopes never read each other's archive.
+DEFAULT_TARGETS = {
+    "gfs": (_gfs_target_run, grids.gfs_scope),
+    "icon": (_icon_target_run, grids.icon_scope),
+}
+
+
+async def refresh_once(store: grids.GridStore, builders: dict | None = None,
+                       targets: dict | None = None,
+                       persist: bool | None = None) -> dict:
     """Try every model once, keeping the last good grid on failure.
 
     Never raises for a single model's failure: one unreachable source must not
     take down the others, and must not blank the site while a good previous run is
     still in memory.
+
+    Two behaviours are layered on top of the build:
+
+    * **Run-identity short-circuit.** With `targets` supplied, each model's
+      *published* run is resolved before any download, and a build is skipped
+      when that run is already loaded. This is what makes "a new fetch only when
+      a new run is actually available" true: a 6-hour refresh loop that wakes up
+      to an unchanged cycle does no work at all.
+    * **Persistence.** A successful build is written to disk and the archive set
+      is pruned to `WX_GRID_KEEP_RUNS` per model, so a restart serves the last
+      run without re-downloading.
+
+    Both are opt-in via `targets`/`persist`, which is what keeps a caller that
+    passes its own `builders` (a test, or an alternate source) on the exact
+    build-every-time behaviour it had before.
     """
-    builders = builders or {"gfs": build_gfs,
-                            "icon": lambda c: build_icon(c, grids.icon_bbox())}
+    builders = builders if builders is not None else DEFAULT_BUILDERS
+    if targets is None and builders is DEFAULT_BUILDERS:
+        targets = DEFAULT_TARGETS
+    targets = targets or {}
+    if persist is None:
+        persist = bool(targets)
     out: dict[str, str] = {}
     async with httpx.AsyncClient(headers=wx.UA, timeout=180) as client:
         for model, build in builders.items():
+            scope = ""
+            resolver = targets.get(model)
+            if resolver is not None:
+                run_fn, scope_fn = resolver
+                try:
+                    target_run = run_fn()
+                    scope = scope_fn()
+                except Exception as e:
+                    # Availability could not be established: do not guess, and do
+                    # not download. Keep serving whatever is already loaded.
+                    msg = f"{type(e).__name__}: {str(e)[:160]}"
+                    store.mark_failure(model, f"run lookup: {msg}")
+                    out[model] = f"failed: run lookup: {msg}"
+                    log.warning("RAM grid %s run lookup failed (%s); keeping current",
+                                model, msg)
+                    continue
+                cur = store.get(model)
+                if cur is None and persist:
+                    # Fresh process: the run we would build may already be on
+                    # disk from before the restart. Restoring it here is what
+                    # turns "restart" into a disk read instead of a re-download,
+                    # and it is what the short-circuit below then compares against.
+                    cur = store.ensure_loaded(model, scope)
+                # Scope is checked as well as the run: changing WX_RAM_ICON_SCOPE
+                # changes what the grid must contain, so a live grid built for the
+                # other box is not a match even at the same run id.
+                live_scope = store.stats.get(model, {}).get("scope", "")
+                if (cur is not None and cur.run == target_run
+                        and live_scope in ("", scope)):
+                    out[model] = f"ok unchanged run={target_run}"
+                    log.info("RAM grid %s unchanged: run=%s (no download)",
+                             model, target_run)
+                    continue
             try:
                 grid = await build(client)
-                store.replace(model, grid)
+                store.replace(model, grid, scope=scope)
+                if persist:
+                    grids.save_grid(grid, scope=scope)
+                    grids.prune_grids()
                 out[model] = f"ok run={grid.run} steps={len(grid.steps)}"
                 log.info("RAM grid %s refreshed: run=%s steps=%d vars=%s",
                          model, grid.run, len(grid.steps), sorted(grid.vars))

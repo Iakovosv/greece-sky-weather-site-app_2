@@ -117,3 +117,23 @@ def test_health_ram_status_surfaces_a_never_loaded_model(client, monkeypatch):
     assert "gfs" in h
     assert "NOMADS is down" in h["gfs"]["last_error"]
 
+
+def test_health_surfaces_grid_persistence_state(client, monkeypatch, tmp_path):
+    """Retention working must be visible, not inferred from the disk.
+
+    `disk_runs` bounded to keep_runs is the operator's evidence that the archive
+    set is not growing without limit, and `disk_bytes` answers "how much is this
+    costing me" without an ssh session.
+    """
+    import grids
+    monkeypatch.setenv("WX_CACHE_DIR", str(tmp_path / "cache"))
+    for run in ("2026010100", "2026010106", "2026010112"):
+        grids.save_grid(grids.synthetic_grid(run=run), scope="greece")
+    grids.prune_grids(keep=2)
+
+    persist = client.get("/api/health").json()["ram_grids"]["models"]["persist"]
+    assert persist["keep_runs"] == 2
+    assert persist["disk_runs"]["gfs|greece"] == 2
+    assert persist["disk_bytes"] > 0
+    assert persist["dir"].endswith("grids")
+

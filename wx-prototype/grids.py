@@ -30,12 +30,19 @@ neither substitutes for the other.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import os
 import threading
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
+
+import config
+
+log = logging.getLogger("wx.grids")
 
 # Greece plus margin. Covers the Ionian and Aegean tourist islands, Crete, and
 # the mainland border ridges, without pulling the whole of Europe.
@@ -275,6 +282,12 @@ def model_orography(grid: GridSpec, lat: float, lon: float) -> float | None:
                            np.asarray(lo, dtype=np.float64), lat, lon)
 
 
+# One process-wide lock for restoring a grid from disk. Deliberately not a per-
+# model lock: the read is a single small file and sharing the guard keeps the
+# "many first requests, one disk read" guarantee simple.
+_LOAD_LOCK = threading.Lock()
+
+
 class GridStore:
     """Thread-safe holder for the live grids, with atomic replacement.
 
@@ -300,7 +313,40 @@ class GridStore:
     def current(self) -> dict[str, GridSpec]:
         return self._current
 
-    def replace(self, model: str, grid: GridSpec) -> None:
+    def ensure_loaded(self, model: str, scope: str = "") -> GridSpec | None:
+        """Return the live grid, restoring the newest persisted run if absent.
+
+        This is the lazy half of the restart story. A freshly started process has
+        an empty store, and the refresher's first pass needs the network; between
+        those two points a request would otherwise fall back to the per-point
+        path and pay the very cost this exists to remove. Reading the newest
+        archive off disk closes that gap without downloading anything.
+
+        Guarded by a process-wide lock so a burst of first requests performs one
+        disk read, not one per request. The fast path (already in RAM) takes no
+        lock at all, so the common case is unchanged.
+        """
+        cur = self._current.get(model)
+        if cur is not None:
+            return cur
+        with _LOAD_LOCK:
+            cur = self._current.get(model)
+            if cur is not None:
+                return cur
+            for m in _grid_metas():
+                if m.get("model") != model or str(m.get("scope", "")) != scope:
+                    continue
+                grid = load_grid(model, str(m.get("run", "")), scope)
+                if grid is None:
+                    continue
+                self.replace(model, grid)
+                self.stats.setdefault(model, {})["loaded_from_disk"] = True
+                log.info("grid restored from disk: model=%s run=%s scope=%r",
+                         model, grid.run, scope)
+                return grid
+            return None
+
+    def replace(self, model: str, grid: GridSpec, scope: str = "") -> None:
         """Publish `grid` as the live one, demoting the old one to `previous`."""
         with self._lock:
             old = self._current.get(model)
@@ -311,7 +357,8 @@ class GridStore:
                 self._previous[model] = old
         self.stats[model] = {"run": grid.run, "loaded_at": grid.loaded_at,
                              "age_s": 0.0, "steps": len(grid.steps),
-                             "vars": sorted(grid.vars), "stale": False}
+                             "vars": sorted(grid.vars), "stale": False,
+                             "scope": scope}
 
     def mark_failure(self, model: str, error: str) -> None:
         """Record a refresh failure without dropping the last good grid."""
@@ -339,12 +386,247 @@ class GridStore:
             if model not in out:
                 # Never loaded: surface the failure rather than an empty dict.
                 out[model] = {k: v for k, v in st.items() if k != "loaded_at"}
+        # Persistence state. `disk_runs` is how many archives exist per model, so
+        # an operator can tell "retention is working" from "nothing is saved".
+        out["persist"] = {"dir": grid_store_dir(),
+                          "keep_runs": GRID_KEEP_RUNS,
+                          "disk_bytes": disk_bytes(),
+                          "disk_runs": _disk_run_counts()}
         return out
 
 
 # The process-wide store. Single uvicorn process by design: the grids are ~hundreds
 # of MB and each worker would otherwise pay for its own copy.
 STORE = GridStore()
+
+
+# ---------------------------------------------------------------- disk persistence
+#
+# The grid in RAM is lost on restart, so without this a deploy or a crash re-paid
+# the entire download and decode for a run that was already on disk seconds
+# earlier. Persisting one decoded grid per (model, run) turns that back into a
+# file read: the refresher still owns *when* a run is fetched, but a process that
+# has just started can serve the last run immediately instead of waiting for the
+# first network refresh to finish.
+#
+# What is stored is the decoded numpy grid, not raw GRIB. That is deliberate and
+# is the same reasoning as the in-RAM form: decoding is the expensive step, and
+# storing encoded GRIB would move that cost onto every reader instead of paying
+# it once. It also means the archive is small — the whole GFS Greece grid is
+# ~14 MB on disk.
+#
+# Keying is by run, not by point: `model|run|scope`. The scope (which ICON box)
+# is part of the key because two deployments configured for different boxes must
+# not read each other's grid. Retention keeps the newest runs per model and
+# deletes the rest, so disk use is bounded by construction rather than by eviction
+# pressure.
+
+# How many runs per model to keep on disk. Two is the minimum that satisfies the
+# "a failed new run still leaves the last good one" requirement across a restart:
+# the newest is what a fresh process serves, the one before it is what it falls
+# back to. More is waste — a superseded weather run is never wanted.
+GRID_KEEP_RUNS = int(os.environ.get("WX_GRID_KEEP_RUNS", "2"))
+
+
+def grid_store_dir() -> str:
+    """Where decoded grids live. Under the cache dir so one env var moves both."""
+    d = os.path.join(config.cache_dir(), "grids")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _grid_stem(model: str, run: str, scope: str = "") -> str:
+    # A hash keeps the name filesystem-safe without inventing a character
+    # allow-list; the model and run are still readable in the hash input's prefix
+    # via `_grid_meta`, which is what an operator actually greps for.
+    tag = f"{model}|{run}|{scope}"
+    return f"{model}-{hashlib.sha256(tag.encode()).hexdigest()[:16]}"
+
+
+def _grid_paths(model: str, run: str, scope: str = "") -> tuple[str, str]:
+    stem = _grid_stem(model, run, scope)
+    return (os.path.join(grid_store_dir(), stem + ".npz"),
+            os.path.join(grid_store_dir(), stem + ".json"))
+
+
+def save_grid(grid: GridSpec, scope: str = "") -> str | None:
+    """Write a decoded grid to disk atomically. Returns the npz path, or None.
+
+    Atomic via a temp file plus `os.replace`, the same pattern as `cachestore`,
+    so a reader never sees a half-written archive and an interrupted save cannot
+    leave a file that decodes to garbage.
+    """
+    npz, meta_p = _grid_paths(grid.model, grid.run, scope)
+    try:
+        payload = {k: v for k, v in grid.vars.items()}
+        payload["__lat"] = np.asarray(grid.lat, dtype=np.float64)
+        payload["__lon"] = np.asarray(grid.lon, dtype=np.float64)
+        payload["__steps"] = np.asarray(grid.steps, dtype=np.int64)
+        # Array-valued metadata (GFS orography and its own axes) travels in the
+        # npz; only scalars go into the JSON. Putting an ndarray in the JSON is
+        # not a formatting detail — it raises, and the whole save is lost.
+        meta_arr: dict[str, np.ndarray] = {}
+        meta_scalar: dict = {}
+        for k, v in grid.meta.items():
+            if isinstance(v, np.ndarray):
+                meta_arr[f"__meta_{k}"] = np.asarray(v)
+                meta_scalar[k] = {"__array__": f"__meta_{k}"}
+            else:
+                meta_scalar[k] = v
+        payload.update(meta_arr)
+        meta = {"model": grid.model, "run": grid.run, "scope": scope,
+                "saved_at": time.time(), "loaded_at": grid.loaded_at,
+                "meta": meta_scalar}
+        tmp = npz + ".tmp"
+        # savez is uncompressed: these arrays are float32 and already dense, and
+        # the read path wants a plain memory map, not a decompress on boot.
+        # Passed an open handle rather than a path because savez appends ".npz"
+        # to a bare filename, which would put the temp file alongside the target
+        # with a name os.replace could not find.
+        with open(tmp, "wb") as f:
+            np.savez(f, **payload)
+        os.replace(tmp, npz)
+        # Metadata is a separate small file so the archive stays a pure array
+        # container that `np.load` can map without a JSON parse.
+        tmp_m = meta_p + ".tmp"
+        with open(tmp_m, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(tmp_m, meta_p)
+        return npz
+    except Exception:
+        log.exception("grid persist failed: model=%s run=%s", grid.model, grid.run)
+        for p in (npz, meta_p, npz + ".tmp", meta_p + ".tmp"):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        return None
+
+
+def load_grid(model: str, run: str, scope: str = "") -> GridSpec | None:
+    """Read a decoded grid back from disk. None if absent or damaged.
+
+    Damage is treated as a miss, not an error: a truncated archive (a save killed
+    mid-flight, or a filesystem that lost a page) must make the caller fetch
+    again rather than crash the boot. That is the same contract as `cachestore`.
+    """
+    npz, meta_p = _grid_paths(model, run, scope)
+    if not (os.path.exists(npz) and os.path.exists(meta_p)):
+        return None
+    try:
+        with open(meta_p, "r", encoding="utf-8") as f:
+            meta_doc = json.load(f)
+        with np.load(npz, allow_pickle=False) as z:
+            lat = z["__lat"]
+            lon = z["__lon"]
+            steps = [int(s) for s in z["__steps"]]
+            names = [k for k in z.files if not k.startswith("__")]
+            vs = {k: z[k] for k in names}
+            raw_meta = meta_doc.get("meta") or {}
+            meta: dict = {}
+            for k, v in raw_meta.items():
+                ref = v.get("__array__") if isinstance(v, dict) else None
+                if ref:
+                    meta[k] = z[ref]
+                else:
+                    meta[k] = v
+        return GridSpec(model=model, run=run, lat=lat, lon=lon, steps=steps,
+                        vars=vs, meta=meta,
+                        loaded_at=float(meta_doc.get("loaded_at") or time.time()))
+    except Exception as e:
+        log.warning("grid load failed (%s), discarding: model=%s run=%s",
+                    e, model, run)
+        for p in (npz, meta_p):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        return None
+
+
+def disk_bytes(folder: str | None = None) -> int:
+    """Total bytes of persisted grid archives (npz + json), for /api/health."""
+    folder = folder or grid_store_dir()
+    total = 0
+    try:
+        with os.scandir(folder) as it:
+            for e in it:
+                try:
+                    if e.is_file(follow_symlinks=False):
+                        total += e.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return total
+
+
+def _disk_run_counts() -> dict:
+    """How many archived runs exist per `model|scope`. For /api/health."""
+    counts: dict[str, int] = {}
+    for m in _grid_metas():
+        key = f"{m.get('model')}|{m.get('scope', '')}"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _grid_metas() -> list[dict]:
+    """Every persisted grid's metadata, newest run first. Unreadable ones skipped."""
+    out: list[dict] = []
+    folder = grid_store_dir()
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(folder, name), "r", encoding="utf-8") as f:
+                out.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    out.sort(key=lambda m: (str(m.get("run", "")), float(m.get("saved_at", 0))),
+             reverse=True)
+    return out
+
+
+def prune_grids(keep: int | None = None) -> dict:
+    """Delete all but the newest `keep` runs per model+scope. Returns a summary.
+
+    Retention by construction rather than by eviction pressure: the disk cache's
+    size cap would evict whatever is oldest across *all* keys, which is the wrong
+    policy here — it could drop the newest GFS run while keeping five old ICON
+    ones. Keeping a fixed count per model is what actually bounds the footprint,
+    because a superseded run is never wanted again.
+    """
+    limit = GRID_KEEP_RUNS if keep is None else keep
+    if limit <= 0:
+        return {"removed": 0, "freed_bytes": 0, "kept": {}}
+    kept: dict[str, int] = {}
+    removed = freed = 0
+    for m in _grid_metas():
+        key = f"{m.get('model')}|{m.get('scope', '')}"
+        kept[key] = kept.get(key, 0) + 1
+        if kept[key] <= limit:
+            continue
+        npz, meta_p = _grid_paths(m.get("model", ""), m.get("run", ""),
+                                  m.get("scope", ""))
+        for p in (npz, meta_p):
+            try:
+                freed += os.path.getsize(p)
+            except OSError:
+                pass
+            try:
+                os.unlink(p)
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        log.info("grid retention: removed %d file(s), freed %.1f MB (keep %d/model)",
+                 removed, freed / 1e6, limit)
+    return {"removed": removed, "freed_bytes": freed,
+            "kept": kept}
 
 
 def flag_enabled() -> bool:
@@ -366,8 +648,18 @@ def icon_bbox() -> dict:
     rather than what a bare flag switch hands you, and why an unrecognised value
     falls back to `greek` instead of guessing.
     """
+    return EUROPE_BBOX if icon_scope() == "europe" else GREEK_BBOX
+
+
+def icon_scope() -> str:
+    """The ICON box name as a string, for persistence keys and /api/health."""
     scope = os.environ.get("WX_RAM_ICON_SCOPE", "greek").strip().lower()
-    return EUROPE_BBOX if scope == "europe" else GREEK_BBOX
+    return "europe" if scope == "europe" else "greece"
+
+
+def gfs_scope() -> str:
+    """GFS is always the Greece box; named so persistence keys are explicit."""
+    return "greece"
 
 
 def synthetic_grid(model: str = "gfs", run: str = "2026010100",

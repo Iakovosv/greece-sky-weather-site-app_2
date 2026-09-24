@@ -340,7 +340,12 @@ async def _notify_series(lat: float, lon: float) -> list[dict] | None:
     model provides it, because the storm rule must not be run on a guess.
     """
     hours = 24
-    ram = grids.STORE.get("gfs") if grids.flag_enabled() else None
+    # `ensure_loaded` matters here as much as in `/api/brief`: after a restart the
+    # persisted run is restored on first use instead of waiting for the refresher's
+    # first network pass, so alerts and the forecast read the same grid from the
+    # first request on.
+    ram = (grids.STORE.ensure_loaded("gfs", grids.gfs_scope())
+           if grids.flag_enabled() else None)
     if ram is not None and not grids.covers(ram, lat, lon):
         ram = None
     if ram is not None:
@@ -4109,7 +4114,8 @@ async def _build_brief(request: Request, lat: float, lon: float, station: str | 
     # while the per-point path subsets server-side and works continent-wide, so
     # without the coverage check a point in Berlin would get a 502 exactly when the
     # flag was switched on.
-    ram = grids.STORE.get("gfs") if grids.flag_enabled() else None
+    ram = (grids.STORE.ensure_loaded("gfs", grids.gfs_scope())
+           if grids.flag_enabled() else None)
     if ram is not None and not grids.covers(ram, lat, lon):
         ram = None
     ram_steps = ([s for s in wx.gfs_steps(hours) if ram.step_index(s) is not None]
@@ -4138,9 +4144,11 @@ async def _build_brief(request: Request, lat: float, lon: float, station: str | 
 
         async def icon_task():
             # The ICON grid is trimmed to the Greece box, so a point outside it
-            # must use the per-point path rather than come back empty.
+            # must use the per-point path rather than come back empty. The lazy
+            # restore mirrors GFS: after a restart the persisted ICON run is used
+            # instead of the per-point path until the first refresh completes.
             if grids.flag_enabled():
-                icon_grid = grids.STORE.get("icon")
+                icon_grid = grids.STORE.ensure_loaded("icon", grids.icon_scope())
                 if icon_grid is not None and grids.covers(icon_grid, lat, lon):
                     return _icon_from_grid(icon_grid, lat, lon, icon_steps)
             out = {}
