@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.grib2
+*.nc
+
+# Configuration with API keys and camera credentials. The template that IS
+# committed is .env.example. Never commit .env itself.
+.env
+.env.*
+!.env.example

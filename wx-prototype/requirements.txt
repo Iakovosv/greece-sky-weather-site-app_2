@@ -1,0 +1,22 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+xarray>=2024.6
+cfgrib>=0.9.15
+eccodes>=2.38
+metpy>=1.7
+cartopy>=0.24
+matplotlib>=3.9
+numpy>=1.26
+pytest>=8.0
+# Sun/moon/twilight for the "Ο Ουρανός Τώρα" card (astro.py). MIT-licensed, so
+# it is safe to ship commercially. Imported defensively: without it the card
+# reports itself unavailable and the forecast page still works.
+ephem>=4.1
+# ERA5 verification (verify.py). Imported lazily, so the forecast paths still
+# work without these, but /api/verify needs them.
+zarr>=3.0
+gcsfs>=2024.6
+# Stripe payments (billing.py). Imported lazily: without it the forecast, the
+# passcode and the trial all work, and the payment button disables itself.
+stripe>=10.0

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.wx-cache/
+*.grib2
+*.grib2.idx
+server.log
