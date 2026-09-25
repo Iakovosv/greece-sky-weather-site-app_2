@@ -911,7 +911,19 @@ td.ph{background:linear-gradient(90deg,rgba(255,255,255,.08),rgba(255,255,255,.1
 .cam .camplayer{display:none;position:relative;aspect-ratio:16/9;background:#000;overflow:hidden}
 .cam .camplayer.playing{display:block}
 .cam .camplayer .camframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:#000}
-.cam .camctl{display:flex;justify-content:flex-end;padding:8px 12px 0}
+/* The control bar is the live flow's home: an in-flow status line and the close
+   control, always *below* the player region, never over the iframe. `[hidden]`
+   is honoured explicitly because the author `display:flex` would otherwise beat
+   the user-agent `[hidden]{display:none}` and leave an empty strip in every card. */
+.cam .camctl{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  flex-wrap:wrap;padding:8px 12px 0}
+.cam .camctl[hidden]{display:none}
+.cam .camctl .camstate{display:inline-flex;align-items:center;gap:10px;flex-wrap:wrap}
+.cam .camctl .livestate{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;
+  font-weight:700;letter-spacing:.05em;color:#fca5a5}
+.cam .camctl .livestate i{width:7px;height:7px;border-radius:50%;background:#ff3b30;display:block;
+  animation:pulse 1.6s ease-in-out infinite}
+.cam .camctl .livehint{font-size:11px;color:var(--dim)}
 .cam .camctl .closecam{background:rgba(17,17,17,.78);
   color:#fff;border:1px solid rgba(255,255,255,.18);font-size:11.5px;padding:5px 11px;
   border-radius:18px;cursor:pointer;font-family:inherit}
@@ -990,6 +1002,7 @@ button.primary:hover{filter:brightness(1.08)}
   .cta h3{font-size:17px}
   .cta .opts{grid-template-columns:1fr}
   .camgrid{grid-template-columns:1fr;gap:11px}
+  .cam .camctl{justify-content:flex-start}
   .sheet{padding:18px;border-radius:13px}
   .veri .big{gap:14px}
   .veri .big .b .v{font-size:21px}
@@ -3057,10 +3070,14 @@ function openCamLive(id){
   }
   // The close control lives in flow, in its own bar below the player -- outside
   // the iframe's surface, never over the official YouTube controls.
+  const state=document.createElement('span');
+  state.className='camstate';
+  state.innerHTML='<span class="livestate"><i></i>LIVE</span>'
+    +'<span class="livehint">Αν δεν ξεκινήσει, πάτησε play στο player.</span>';
   const close=document.createElement('button');
   close.className='closecam'; close.textContent='Κλείσιμο LIVE';
   close.onclick=()=>closeCamLive(id);
-  bar.innerHTML=''; bar.appendChild(close); bar.hidden=false;
+  bar.innerHTML=''; bar.appendChild(state); bar.appendChild(close); bar.hidden=false;
 }
 function closeCamLive(id){
   const stage=document.getElementById('camstage-'+id);
