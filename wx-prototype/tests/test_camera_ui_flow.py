@@ -231,9 +231,9 @@ def test_live_open_and_close_are_wired_to_the_same_card(tpl):
                "function youtubeEmbedUrl(videoId)", "function showLiveFallback(player,msg)"):
         assert fn in tpl
     # Close returns to the last snapshot: the stage loses `playing` and the image
-    # is refreshed, which is the observable "back to snapshot" behaviour.
+    # is refreshed through the shared resolver (which picks direct vs server).
     assert "stage.classList.remove('playing')" in tpl
-    assert "img.src=c.snapshot+sep+'t='+CAMS.stamp" in tpl
+    assert "img.src=camSnapshotSrc(c, CAMS.stamp)" in tpl
 
 
 # ------------------------------------------------- YouTube embed policy

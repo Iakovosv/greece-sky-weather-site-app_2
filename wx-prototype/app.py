@@ -55,6 +55,7 @@ import notify  # noqa: E402
 import promo  # noqa: E402
 import ratelimit  # noqa: E402
 import scheduler  # noqa: E402
+import snapshots  # noqa: E402
 import verify as vfy  # noqa: E402
 import wx  # noqa: E402
 
@@ -2991,9 +2992,10 @@ function renderCameras(){
   if(CAMS.note!=null) document.getElementById('cam-sub').textContent=CAMS.note;
   box.innerHTML=CAMS.cameras.map(c=>{
     const live=c.status==='live';
-    const src=live? c.snapshot+(c.snapshot.includes('?')?'&':'?')+'t='+CAMS.stamp : '';
+    const src=live? camSnapshotSrc(c, CAMS.stamp) : '';
     const stage = live
-      ? '<img id="camimg-'+c.id+'" src="'+esc(src)+'" alt="'+esc(c.name)+'" loading="lazy">'
+      ? '<img id="camimg-'+c.id+'" src="'+esc(src)+'" alt="'+esc(c.name)+'" loading="lazy"'
+        +' onerror="snapshotFailed(\''+esc(c.id)+'\')">'
       : '<div class="off">Δεν έχει συνδεθεί ζωντανή ροή<br><b>'+esc(c.name)+'</b></div>';
     const badge = live
       ? '<div class="live"><i></i>LIVE</div>'
@@ -3025,6 +3027,34 @@ function renderCameras(){
   }).join('');
 }
 function pluralMin(n){ return n===1? 'λεπτό':'λεπτά'; }
+/* Where a still comes from. Today that is normally the feed's own public URL
+   ("direct"), which the browser loads exactly as it always has. A camera whose
+   source is private is marked snapshot_via==="server": its URL must never reach
+   the browser, so the image is proxied through /api/cameras/<id>/snapshot. The
+   server decides which, per camera, so a private source can be added later
+   without touching this card. */
+function camSnapshotSrc(c, stamp){
+  const sep=c.snapshot.includes('?')?'&':'?';
+  if(c.snapshot_via==='server'){
+    return '/api/cameras/'+encodeURIComponent(c.id)+'/snapshot?t='+stamp;
+  }
+  return c.snapshot+sep+'t='+stamp;
+}
+/* A still that failed to load must not render as a broken icon: the server-side
+   path fails generically (503/504) and the card says so, the same as a feed that
+   is not wired up. Keeps the failure legible instead of looking like an outage. */
+function snapshotFailed(id){
+  const c=CAMS&&CAMS.cameras.find(x=>x.id===id);
+  const img=document.getElementById('camimg-'+id);
+  if(img) img.style.display='none';
+  const stage=document.getElementById('camstage-'+id);
+  if(stage && !stage.querySelector('.off')){
+    const d=document.createElement('div');
+    d.className='off';
+    d.innerHTML='Η εικόνα δεν είναι διαθέσιμη<br><b>'+esc((c&&c.name)||'')+'</b>';
+    stage.appendChild(d);
+  }
+}
 /* Live playback is a *provider* concern, not a WebRTC one. Today the only
    provider is YouTube, embedded through the official player with the public
    video id the server publishes. The camera's own address never reaches the
@@ -3090,8 +3120,7 @@ function closeCamLive(id){
   const img=document.getElementById('camimg-'+id);
   if(c&&img){ // refresh to the newest frame rather than the stale one
     CAMS.stamp=Math.floor(Date.now()/60000);
-    const sep=c.snapshot.includes('?')?'&':'?';
-    img.src=c.snapshot+sep+'t='+CAMS.stamp;
+    img.src=camSnapshotSrc(c, CAMS.stamp);
   }
 }
 function showLiveFallback(player,msg){
@@ -3115,8 +3144,7 @@ function tickCameras(){
     if(c.status!=='live') continue;
     const img=document.getElementById('camimg-'+c.id);
     if(!img) continue;
-    const sep=c.snapshot.includes('?')?'&':'?';
-    img.src=c.snapshot+sep+'t='+CAMS.stamp;
+    img.src=camSnapshotSrc(c, CAMS.stamp);
   }
 }
 function toggleLive(){
@@ -4012,6 +4040,9 @@ async def health():
         # an operator whether the private store parsed; a malformed blob shows
         # here as 0 without printing what it contained.
         "cameras": cams.health(),
+        # Snapshot runtime: counts of resolved sources by kind, and how many are
+        # still the offline mock. Never a URL, host or credential.
+        "snapshots": snapshots.health(),
         "data_sources": ["GFS (public domain)", "ICON-EU DWD (CC BY 4.0)",
                          "ECMWF open data (CC BY 4.0, best-effort)",
                          "Photon geocoding (OSM)", "OpenTopoData DEM"],
@@ -4673,8 +4704,19 @@ async def cameras_endpoint():
     URL, credentials) lives in a separate store that no endpoint reads; the
     payload is built from an explicit whitelist in cameras.py, so a new private
     key cannot leak by being carried along.
+
+    ``snapshot_via`` is added here, not in the camera schema in cameras.py, so the
+    server-side snapshot runtime is presentation metadata grafted onto the payload
+    rather than a change to what a camera *is*. It tells the browser whether to
+    load the still itself ("direct", today's behaviour) or through the server
+    ("server", for a private source the browser must never see).
     """
-    return cams.camera_payload()
+    payload = cams.camera_payload()
+    for cam in payload.get("cameras", []):
+        via = snapshots.snapshot_via(cam.get("id", ""))
+        if via:
+            cam["snapshot_via"] = via
+    return payload
 
 
 @app.get("/api/cameras/{camera_id}")
@@ -4689,6 +4731,44 @@ async def camera_endpoint(camera_id: str):
     if cam is None:
         raise HTTPException(404, "Η κάμερα δεν υπάρχει.")
     return cam
+
+
+@app.get("/api/cameras/{camera_id}/snapshot")
+async def camera_snapshot_endpoint(camera_id: str):
+    """The latest still for a camera, fetched server-side from the trusted source.
+
+    The request names a camera *id* only. The URL to fetch comes from the private
+    camera configuration, never from the caller, so no client input can name a
+    host. The response is an image or a generic error; it never carries the source
+    URL, a host, or a credential.
+
+    Every failure collapses to one of three answers on purpose, and unknown vs
+    disabled vs unreachable are deliberately indistinguishable:
+
+    * ``404`` no enabled camera with that id (also covers disabled);
+    * ``503`` the camera exists but a frame is not available right now (no source
+      configured, rejected config, or the upstream failed);
+    * ``504`` the upstream did not answer within the read timeout.
+
+    A caller cannot learn from the response whether a particular internal host
+    exists, is reachable, or is slow.
+    """
+    try:
+        snap = await snapshots.get_snapshot(camera_id)
+    except snapshots.UnknownCamera:
+        raise HTTPException(404, "Η κάμερα δεν υπάρχει.")
+    except (snapshots.NoSource, snapshots.SourceRejected):
+        log.warning("snapshot unavailable: camera=%s reason=%s",
+                    camera_id, "no source")
+        raise HTTPException(503, "Η εικόνα δεν είναι διαθέσιμη αυτή τη στιγμή.")
+    except snapshots.FetchFailed as e:
+        is_timeout = "timeout" in str(e).lower()
+        log.warning("snapshot fetch failed: camera=%s reason=%s",
+                    camera_id, "timeout" if is_timeout else "upstream")
+        raise HTTPException(504 if is_timeout else 503,
+                            "Η εικόνα δεν είναι διαθέσιμη αυτή τη στιγμή.")
+    return Response(content=snap.data, media_type=snap.content_type,
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/verify")
