@@ -1355,6 +1355,7 @@ document.addEventListener('toggle',e=>{
   if(!el || !el.open || !el.id) return;
   if(el.id==='x-skewt') track('skewt_opened');
   else if(el.id==='x-models') track('model_comparison_opened');
+  else if(el.id==='x-ens') track('ensemble_opened');
 },true);
 
 function openModal(){
@@ -2708,6 +2709,10 @@ function renderExpert(d){
       lockedBlock('models','Η σύγκριση 3 μοντέλων είναι διαθέσιμη στο PRO',
         'GFS 0.25°, ICON-EU 7 km και ECMWF IFS δίπλα-δίπλα, με τη μεταξύ τους απόκλιση '
         +'ως ένδειξη συμφωνίας των μοντέλων.'));
+    h+=xsec('x-ens','Σύνολο GEFS','PRO',
+      lockedBlock('ens','Το σύνολο GEFS είναι διαθέσιμο στο PRO',
+        'Μέσος όρος και διασπορά των 30 διαταραγμένων μελών του GEFS για θερμοκρασία, '
+        +'άνεμο, ριπές, υετό και νέφωση σε πολλά βήματα πρόγνωσης.'));
     h+=xsec('x-levels','Κατακόρυφη δομή','PRO',
       lockedBlock('levels','Η κατακόρυφη δομή είναι διαθέσιμη στο PRO',
         'Πίεση, ύψος, θερμοκρασία, σημείο δρόσου, σχετική υγρασία και άνεμος για κάθε '
@@ -2779,10 +2784,6 @@ function expertBody(d){
       +e.agreement.text+'</span> '+(e.agreement.detail||'')+'</p>'
       +'<p class="note">Εκτίμηση από τη σύγκλιση μοντέλων, όχι από ιστορικό σφάλμα. Αν όλα τα '
       +'μοντέλα κάνουν το ίδιο λάθος, η τιμή θα φαίνεται υψηλή.</p>'
-      +(e.ensemble
-        ? '<p class="note"><b>Διασπορά GEFS ('+e.ensemble.members+' μελών): '
-          +esc(e.ensemble.text)+'</b> — '+esc(e.ensemble.detail)+'</p>'
-        : '')
       +'</div>';
   }
 
@@ -2797,6 +2798,56 @@ function expertBody(d){
     t+='</tbody></table><p class="note">Το GFS είναι ωριαίο. Το ICON-EU δημοσιεύει ανά ώρα έως +24h '
       +'και κάθε 3 ώρες μετά, επομένως η στήλη +24h χρησιμοποιεί το διαθέσιμο βήμα.</p>';
     h+=xsec('x-models','Σύγκριση μοντέλων','GFS · ICON · ECMWF',t);
+  }
+
+  /* The ensemble panel is deliberately its own section, not a footnote under
+     the 3-model agreement. The two answer different questions: agreement is how
+     far three deterministic models sit from each other; the ensemble is how far
+     30 perturbed GEFS members sit from their own mean. The section text says so
+     rather than leaving the reader to guess. */
+  if(e.ensemble){
+    const en=e.ensemble;
+    if(!en.available){
+      h+=xsec('x-ens','Σύνολο GEFS','μη διαθέσιμο',
+        '<p class="note">'+esc(en.detail||'')+'</p>');
+    } else {
+      /* One cell helper for "value (spread)": a missing half reads as an em
+         dash, never as a zero, so an unavailable spread is not shown as perfect
+         agreement. `sp` is prefixed with ± because every spread column is a
+         spread. */
+      const cell=(v,sp,unit,dec)=>{
+        if(v==null && sp==null) return '—';
+        const val=(v==null?'—':(dec?n1(v):n0(v))+(unit?' '+unit:''));
+        const spr=(sp==null?'':' ±'+(dec?n1(sp):n0(sp)));
+        return val+spr;
+      };
+      let t='<table class="dense"><thead><tr><th>Βήμα</th><th>Θερμ.</th>'
+        +'<th>Άνεμος</th><th>Ριπές</th><th>Υετός 6h</th><th>Νέφωση</th>'
+        +'</tr></thead><tbody>';
+      for(const l of en.leads){
+        t+='<tr><td>+'+l.hours+' h</td>'
+          +'<td>'+cell(l.t2m_c,l.t2m_spread_c,'°C',1)+'</td>'
+          +'<td>'+(l.wind_kmh==null?'—':n1(l.wind_kmh)+' km/h ('+n0(l.wind_dir)+'°)')
+            +(l.wind_spread_kmh==null?'':' <span class="mm">±'+n1(l.wind_spread_kmh)+'</span>')+'</td>'
+          +'<td>'+cell(l.gust_kmh,l.gust_spread_kmh,'km/h',1)+'</td>'
+          +'<td>'+cell(l.precip_mm,l.precip_spread_mm,'mm',1)+'</td>'
+          +'<td>'+cell(l.cloud_pct,l.cloud_spread_pct,'%',0)+'</td>'
+          +'</tr>';
+      }
+      t+='</tbody></table>'
+        +'<p class="note">Μέσος όρος και διασπορά των <b>'+en.members
+        +' διαταραγμένων μελών</b> του GEFS (πηγή: NOAA, <span class="mm">'
+        +esc(en.source||'')+'</span>). Η διασπορά είναι η τυπική απόκλιση των μελών '
+        +'(«ens std dev» κατά NCEP) γύρω από τον μέσο όρο τους, όχι πιθανότητα ούτε '
+        +'δείκτης αξιοπιστίας. Ο υετός είναι συσσώρευση 6 ωρών και η νέφωση μέσος '
+        +'όρος 6 ωρών, όπως τα δημοσιεύει το GEFS· δεν αθροίζονται μεταξύ βημάτων. '
+        +'Η διασπορά ανέμου είναι το μέτρο του <b>διανυσματικού</b> σφάλματος, όχι '
+        +'διασπορά ταχύτητας.</p>'
+        +'<p class="note">Διαφέρει από τη «Συμφωνία μοντέλων»: εκείνη μετρά πόσο '
+        +'απέχουν τρία ντετερμινιστικά μοντέλα μεταξύ τους, εδώ πόσο απέχουν 30 '
+        +'διαταραγμένες εκδοχές του ίδιου μοντέλου από τον μέσο όρο τους.</p>';
+      h+=xsec('x-ens','Σύνολο GEFS',en.members+' μέλη · μέσος όρος και διασπορά',t);
+    }
   }
 
   if(e.levels){
@@ -4537,16 +4588,15 @@ async def _build_brief(request: Request, lat: float, lon: float, station: str | 
             return {}
 
         async def ensemble_task():
-            # GEFS mean/spread: a genuinely 31-member spread behind the agreement
-            # figure, which otherwise rests on three deterministic runs. Best
-            # effort by design - if NOMADS is slow the 3-model spread stands in,
-            # and it is never allowed to fail the forecast. Skipped entirely for a
-            # FREE caller: the expert block that consumes it is PRO-only, so the
-            # extra NOMADS load would be spent on nobody.
+            # GEFS mean/spread for its own PRO panel: temperature, wind, gusts,
+            # precipitation and cloud at a few leads. Best effort by design - a
+            # NOMADS outage leaves the panel unavailable and never touches the
+            # forecast. Skipped entirely for a FREE caller: the panel is PRO-only,
+            # so the extra NOMADS load would be spent on nobody.
             if not entl.is_pro:
                 return {}
             try:
-                return await ensemble.gefs_ensemble_point(c, lat, lon, step=24)
+                return await ensemble.gefs_ensemble_series(c, lat, lon)
             except Exception:
                 return {}
 
@@ -4635,16 +4685,13 @@ async def _build_brief(request: Request, lat: float, lon: float, station: str | 
                          "msl_hpa": round(ec["msl"] / 100, 1) if ec.get("msl") else None})
         expert["model_grid"] = grid
         expert["agreement"] = agreement(temperature_series_for_agreement(gfs_rows, icon, ec))
-        # The GEFS ensemble, when it is available, adds a distribution-aware
-        # number alongside the 3-model spread: 30 perturbed members against 3
-        # deterministic runs. It is additive - the 3-model figure stays, so the
-        # card degrades to today's behaviour if NOMADS does not answer. It is
-        # reported as a spread, never as "confidence"; see ensemble.describe().
-        ens_ok = isinstance(ens, dict) and ens.get("t2m_spread_c") is not None
-        if ens_ok:
-            expert["ensemble"] = ensemble.describe(
-                ens["t2m_spread_c"], members=ens.get("members", ensemble.GEFS_PERTURBED_MEMBERS),
-                mean_c=ens.get("t2m_mean_c"), hours=ens.get("step")) | {"run": ens.get("run")}
+        # The GEFS ensemble, when it is available, gets its own panel: 30
+        # perturbed members against 3 deterministic runs, across several
+        # variables. It is additive - the 3-model figure stays, and the panel
+        # simply goes unavailable if NOMADS does not answer. Everything is
+        # reported as a mean/spread, never as "confidence"; see ensemble.py.
+        if isinstance(ens, dict) and ens.get("leads"):
+            expert["ensemble"] = ensemble.describe_series(ens)
         if isinstance(gfs_rows[0], dict):
             expert["gfs_now"] = {k: (round(v, 2) if isinstance(v, float) else v)
                                  for k, v in gfs_rows[0].items()}
