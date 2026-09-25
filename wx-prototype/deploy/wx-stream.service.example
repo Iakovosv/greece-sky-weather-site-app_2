@@ -1,0 +1,89 @@
+# systemd unit template for the Greece Sky weather app.
+#
+# This is an ARTIFACT, not a live configuration: nothing here is installed or
+# enabled by the repository. Copy it to
+#   /etc/systemd/system/wx-stream-<name>.service
+# replace every <PLACEHOLDER>, then `systemctl daemon-reload && enable --now`.
+#
+# The hardening below matters specifically for the camera ingest path, which
+# supervises a video-only FFmpeg child that reads an RTSP URL carrying a
+# credential. See deploy/STREAM_ACTIVATION.md for the full runbook.
+
+[Unit]
+Description=Greece Sky weather site (<name>)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<WX_USER>
+Group=<WX_GROUP>
+WorkingDirectory=/opt/<name>
+
+# Secrets and all runtime configuration come from this file (mode 0600, owned by
+# <WX_USER>). It is NOT part of the repository. Set WX_ENV=production here.
+EnvironmentFile=/etc/<name>/env
+
+ExecStart=/opt/<name>/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 12000
+
+Restart=on-failure
+RestartSec=3
+
+# ---------------------------------------------------------------- hardening
+# Filesystem: the service may write only where it must. WX_DB, the GRIB/result
+# cache and the short-lived secret directory all live under /var/lib/<name>;
+# ReadWritePaths is what carves them out of ProtectSystem=strict.
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/<name>
+PrivateTmp=yes
+# The camera worker's status lives in WX_DB (SQLite + WAL), and its secret files
+# live under WX_STREAM_SECRET_DIR; both must be writable under /var/lib/<name>.
+
+# Kernel / devices / privileges: the app is a plain web process and needs none.
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# Syscalls: a normal service set. This blocks `ptrace` and the debugging surface
+# a compromised demuxer would otherwise reach for.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# /proc exposure: hide other users' processes from the unit. NOTE this protects
+# the unit from *others*, not others from the unit -- it does not hide the
+# service's own /proc/<pid>/cmdline from local users. That is exactly why the
+# ingest worker keeps the RTSP credential out of argv (see SecretFileStore);
+# argv hygiene, not ProtectProc, is the credential control.
+ProtectProc=invisible
+ProcSubset=pid
+
+# Network: TCP only (RTSP-over-TCP, RTMPS, NOMADS/HTTP). No raw sockets, no
+# packet capture.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ---------------------------------------------------------------- resources
+# CPU/RAM ceilings so one wedged stream cannot starve the web tier. Tune to the
+# VPS size; the app's own WX_STREAM_MAX_ACTIVE cap is the primary control.
+# NB: the ingest FFmpeg re-encodes to H.264, so a single stream is genuinely
+# CPU-hungry; size CPUQuota for one stream first and raise only with evidence.
+CPUQuota=200%
+MemoryMax=1500M
+TasksMax=256
+
+# ---------------------------------------------------------------- logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=<name>
+
+[Install]
+WantedBy=multi-user.target

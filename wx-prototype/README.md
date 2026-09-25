@@ -233,6 +233,34 @@ Endpoints (admin-only, όχι public start/stop ακόμη):
 + ένα πραγματικό RTMPS destination, εγκατάσταση FFmpeg, και ενεργό
 `WX_STREAM_ENABLED=1`. Μέχρι τότε ο builder αρνείται κάθε start με `no_output`.
 
+### M3-B — production readiness & argv hygiene
+
+Ολοκληρώνει το M3-A χωρίς να αλλάξει τα `FREE=72h` / `PRO=240h` ή οποιοδήποτε
+forecast endpoint. Δύο πράγματα άλλαξαν και ένα προστέθηκε:
+
+1. **Το credential δεν είναι πια στο argv.** Στο M3-A το RTSP URL (με userinfo)
+   ήταν `-i <url>`, που σημαίνει ότι κάθε τοπικός χρήστης το διάβαζε από το
+   `/proc/<ffmpeg-pid>/cmdline` (mode 0444). Τώρα το input γράφεται σε αρχείο
+   `0600` και το FFmpeg το διαβάζει με τη documented μορφή «argument from file»:
+   `-/i <path>`. Το stream key του RTMPS πηγαίνει στο ίδιο ιδιωτικό αρχείο μέσω
+   `-/rtmp_playpath`, και το positional output είναι πλέον ο **σκέτος host**
+   (`-rtmp_app` είναι option). Το `SecretFileStore` φτιάχνει `0700` directory,
+   `0600` files, atomic write (tmp + `os.replace`), αρνείται symlinked directory,
+   και τα σβήνει σε stop / shutdown / κάθε terminal path του supervisor.
+
+   Σημείωση: το `ProtectProc=invisible`/`hidepid` **δεν** λύνει αυτό το πρόβλημα —
+   κρύβουν *άλλες* διεργασίες από τη unit, όχι τη unit από τους άλλους. Η άρση
+   του credential από το argv είναι ο πραγματικός έλεγχος.
+
+2. **Deploy readiness probe.** Το `/api/health` → `streams.ready` λέει αν το real
+   backend θα μπορούσε πραγματικά να ξεκινήσει (backend=real, FFmpeg παρόν,
+   usable secret dir, resolvable ingest destination) ως booleans + πλήθος, ποτέ
+   path/host/key.
+
+Νέα μεταβλητή: **`WX_STREAM_SECRET_DIR`** (default `<WX_CACHE_DIR>/stream-secrets`,
+`0700`). Ο runbook ενεργοποίησης είναι στο `deploy/STREAM_ACTIVATION.md` και το
+hardened systemd template στο `deploy/wx-stream.service.example`.
+
 ## Βαθμίδες
 
 Το κλείδωμα εφαρμόζεται **στον server**, όχι με CSS. Στο FREE το `/api/brief`

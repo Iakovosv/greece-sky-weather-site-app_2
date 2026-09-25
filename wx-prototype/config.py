@@ -243,6 +243,20 @@ def stream_backend() -> str:
     return _env("WX_STREAM_BACKEND") or "mock"
 
 
+def stream_secret_dir() -> str:
+    """Directory for the short-lived secret files the ingest worker writes.
+
+    Holds the credential-bearing input URL (and the stream key) for the seconds
+    between building an FFmpeg command and the process reading it, so neither has
+    to appear in argv. Defaults to ``<cache_dir>/stream-secrets``; overridable
+    with ``WX_STREAM_SECRET_DIR``. It is created 0700 on first use and its files
+    are 0600 (see ``ingest_command.SecretFileStore``). It must be on local disk --
+    never a world-readable or network location.
+    """
+    return _env("WX_STREAM_SECRET_DIR") or os.path.join(cache_dir(),
+                                                        "stream-secrets")
+
+
 # These are read once, at import. That is correct for `ENV` because
 # `envfile.load()` runs before this module is imported (app.py imports it first),
 # and because a "which environment am I" decision must not change mid-process.

@@ -43,6 +43,7 @@ import time
 
 import ingest_command
 import ingest_process
+import config
 
 log = logging.getLogger("wx.ingest_worker")
 
@@ -116,7 +117,8 @@ class RealStreamWorker:
                  rand=None, heartbeat_interval_s: float | None = None,
                  stop_grace_s: float = STOP_GRACE_S,
                  kill_grace_s: float = KILL_GRACE_S,
-                 launch_grace_s: float = LAUNCH_GRACE_S) -> None:
+                 launch_grace_s: float = LAUNCH_GRACE_S,
+                 secret_store: "ingest_command.SecretFileStore | None" = None) -> None:
         self._factory = factory or ingest_process.AsyncioProcessFactory()
         self._build = builder or ingest_command.build_command
         self._sleep = sleep
@@ -128,8 +130,19 @@ class RealStreamWorker:
         self._stop_grace_s = stop_grace_s
         self._kill_grace_s = kill_grace_s
         self._launch_grace_s = launch_grace_s
+        # Where the credential-bearing input URL is written so it never reaches
+        # argv (the M3-B L3 fix). Built lazily, from config, so a test can point
+        # it at tmp_path and a deploy can point it at its own private directory.
+        self._secret_store = secret_store
         self._jobs: dict[str, _Job] = {}
         self._mutex = asyncio.Lock()
+
+    @property
+    def secret_store(self) -> "ingest_command.SecretFileStore":
+        if self._secret_store is None:
+            self._secret_store = ingest_command.SecretFileStore(
+                config.stream_secret_dir())
+        return self._secret_store
 
     # ------------------------------------------------------------- public API
 
@@ -155,7 +168,15 @@ class RealStreamWorker:
                 # same job, never a second process.
                 return "starting"
             command = self._command_for(cam_id)
-            handle = await self._spawn(command)
+            try:
+                handle = await self._spawn(command)
+            except Exception:
+                # The build already wrote the credential file (before the spawn
+                # could fail), and no supervisor exists to clean it up. Remove it
+                # here, then let the control plane record the failure.
+                self.secret_store.remove(cam_id)
+                self.secret_store.remove(cam_id, "key")
+                raise
             job = _Job(cam_id, command, handle)
             self._jobs[cam_id] = job
             job.task = asyncio.create_task(self._supervise(job))
@@ -184,6 +205,10 @@ class RealStreamWorker:
             except (asyncio.CancelledError, Exception):
                 pass
         await self._terminate(job.handle)
+        # The credential file is no longer needed once the process is gone. Delete
+        # it on both the happy and the escalated path: it holds the RTSP userinfo.
+        self.secret_store.remove(cam_id)
+        self.secret_store.remove(cam_id, "key")
         self._set(cam_id, "stopped")
 
     async def shutdown(self) -> None:
@@ -208,7 +233,8 @@ class RealStreamWorker:
         try:
             source = ingest_command.resolved_source(cam_id)
             return self._build(cam_id, source,
-                               ingest_url=_resolve_ingest_url(cam_id))
+                               ingest_url=_resolve_ingest_url(cam_id),
+                               secret_store=self.secret_store)
         except ingest_command.CommandBuildError as e:
             raise _worker_error(e.reason)
         except Exception as e:  # a builder must never crash the control plane
@@ -297,6 +323,13 @@ class RealStreamWorker:
             log.warning("ingest supervisor crashed: camera=%s type=%s",
                         cam_id, type(e).__name__)
             self._set(cam_id, "error", error_reason="unknown")
+        finally:
+            # Every terminal path -- gave up, disabled, crash-loop exhausted,
+            # cancelled -- leaves the supervisor here. Remove the credential file
+            # so it does not outlive the stream; stop() also does this, and both
+            # are idempotent (remove never raises).
+            self.secret_store.remove(cam_id)
+            self.secret_store.remove(cam_id, "key")
 
     async def _beat(self, job: _Job) -> None:
         """Heartbeat on the worker's cadence while the process is supervised."""
@@ -384,11 +417,11 @@ def _resolve_ingest_url(camera_id: str) -> str | None:
     """The server-side RTMPS destination for a camera, or None.
 
     The stream key is resolved here, from the same private store that holds the
-    RTSP material, and is returned only as part of a URL the builder places in
-    argv. It is never returned to a caller, logged, or stored on a command
-    attribute. Until the VPS secrets milestone wires a real value, this returns
-    None and the builder refuses the command -- so no stream key exists anywhere
-    in this build.
+    RTSP material, and is returned only so the builder can write it into the
+    private secret file FFmpeg reads. It is never returned to a caller, logged, or
+    stored on a command attribute. Until the VPS secrets milestone wires a real
+    value, this returns None and the builder refuses the command -- so no stream
+    key exists anywhere in this build.
     """
     import cameras as cams
     ref = os.environ.get("WX_CAMERA_INGEST_REF")
@@ -396,3 +429,35 @@ def _resolve_ingest_url(camera_id: str) -> str | None:
         return None
     value = cams.resolve_secret({"secret_ref": ref})
     return value or None
+
+
+def activation_ready() -> dict:
+    """Whether the real ingest backend could actually start, as booleans only.
+
+    A deploy-readiness probe, not a public contract: it answers "if streams were
+    enabled right now, would a start work?" without naming an env var, a path, a
+    host or a key. It checks what the real worker needs, cheapest first: the
+    backend is ``real``; FFmpeg is on PATH; and the private secret directory can
+    be created. ``unconfigured_cameras`` is a count, never a list of ids.
+
+    When the backend is not ``real`` it returns without touching the filesystem --
+    the mock needs none of this.
+    """
+    import shutil
+    if (config.stream_backend() or "mock").strip().lower() != "real":
+        return {"ready": False, "reason": "backend_not_real"}
+    try:
+        if shutil.which("ffmpeg") is None:
+            return {"ready": False, "reason": "ffmpeg_missing"}
+    except Exception:  # pragma: no cover - which does not raise
+        return {"ready": False, "reason": "ffmpeg_missing"}
+    try:
+        ingest_command.SecretFileStore(config.stream_secret_dir()).ensure_usable()
+    except OSError:
+        return {"ready": False, "reason": "secret_dir_unusable"}
+    import cameras as cams
+    missing = sum(1 for cam in cams.load_config()
+                  if not _resolve_ingest_url(str(cam.get("id", ""))))
+    return {"ready": missing == 0,
+            "reason": None if missing == 0 else "no_ingest_destination",
+            "unconfigured_cameras": missing}

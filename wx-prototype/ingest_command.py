@@ -58,6 +58,7 @@ BUILD_REASONS = frozenset({
     "audio_not_allowed",
     "no_output",
     "not_startable",
+    "secret_store_unavailable",
 })
 
 
@@ -69,6 +70,98 @@ _ENV_PASSTHROUGH = (
     "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR",
     "SSL_CERT_FILE", "SSL_CERT_DIR",
 )
+
+
+class SecretFileStore:
+    """A private directory holding one short-lived secret file per camera.
+
+    Why this exists (M3-B, the L3 fix)
+    ----------------------------------
+    An RTSP credential placed on the command line is readable by *any* local user
+    through ``/proc/<pid>/cmdline`` -- that file is mode 0444, and neither
+    ``ProtectProc=invisible`` nor ``hidepid`` reliably fixes it (the former hides
+    *other* users' processes from the unit, not the unit from others; the latter
+    is a host-wide mount option we do not control). The only self-contained fix is
+    to keep the credential out of the argv entirely, which FFmpeg supports: an
+    option's argument can be read from a file by writing ``-/`` before the option
+    name (documented in ``ffmpeg(1)``, "argument from file"). So the input URL --
+    the one carrying the RTSP userinfo -- is written here and FFmpeg is given
+    ``-/i <path>`` instead of ``-i <url>``.
+
+    Guarantees:
+    * the directory is ``0700`` and each file ``0600``, created with O_NOFOLLOW;
+    * the value is written with no trailing newline (the slurp is verbatim);
+    * the write is atomic (tmp file + ``os.replace``) so FFmpeg never opens a
+      half-written file;
+    * the file holds the *input URL only* -- never the log-safe summary.
+
+    This store is deliberately not a general secret manager: it exists for the
+    seconds between building a command and FFmpeg's first read, and is emptied on
+    stop/shutdown.
+    """
+
+    def __init__(self, directory: str) -> None:
+        self.directory = str(directory)
+
+    def ensure_usable(self) -> None:
+        """Create/verify the private directory. Raises OSError when unusable.
+
+        Public because a deploy-readiness probe must be able to ask "could this
+        store be used?" without writing a secret; :meth:`write` calls it too.
+        """
+        os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        # A symlinked "directory" would silently redirect every secret file it
+        # holds to wherever the link points, so refuse one outright rather than
+        # trusting the path.
+        if os.path.islink(self.directory):
+            raise OSError("secret dir is a symlink")
+        try:
+            os.chmod(self.directory, 0o700)
+        except OSError:
+            pass
+
+    def path_for(self, camera_id: str, role: str = "in") -> str:
+        """A file path for one camera and one role (``in`` or ``key``).
+
+        The camera id is sanitized to ``[A-Za-z0-9_-]`` so it can never act as a
+        path component; any other character (including ``.`` and ``/``) is dropped,
+        which also rules out ``..`` traversal.
+        """
+        safe = "".join(ch for ch in str(camera_id) if ch.isalnum() or ch in "-_")
+        if not safe:
+            safe = "camera"
+        role = "key" if role == "key" else "in"
+        return os.path.join(self.directory, f"{safe}-{role}.url")
+
+    def write(self, camera_id: str, value: str, role: str = "in") -> str:
+        """Atomically write ``value`` 0600 and return the path. Raises OSError."""
+        self.ensure_usable()
+        path = self.path_for(camera_id, role)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                         | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except OSError:
+            raise
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(value)          # no trailing newline: the slurp is verbatim
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return path
+
+    def remove(self, camera_id: str, role: str = "in") -> None:
+        """Best-effort delete. Never raises: cleanup must not break a stop."""
+        try:
+            os.unlink(self.path_for(camera_id, role))
+        except OSError:
+            pass
 
 
 class CommandBuildError(Exception):
@@ -95,14 +188,19 @@ class IngestCommand:
     can remove.
     """
 
-    __slots__ = ("argv", "env", "summary", "_secrets")
+    __slots__ = ("argv", "env", "summary", "_secrets", "secret_file")
 
     def __init__(self, argv: list[str], env: dict[str, str], summary: str,
-                 secrets: tuple[str, ...] = ()) -> None:
+                 secrets: tuple[str, ...] = (),
+                 secret_file: str | None = None) -> None:
         self.argv = argv
         self.env = env
         self.summary = summary
         self._secrets = tuple(s for s in secrets if s)
+        # The on-disk file FFmpeg reads the input URL from (see SecretFileStore).
+        # It holds the credential, so it is *not* a secret in the redaction list --
+        # it is the path FFmpeg needs. Nothing logs it.
+        self.secret_file = secret_file
 
     def __repr__(self) -> str:  # never let a repr leak the argv
         return f"<IngestCommand {self.summary}>"
@@ -110,8 +208,10 @@ class IngestCommand:
     def safe_argv(self) -> list[str]:
         """The argv with every known secret replaced, for logging or diagnostics.
 
-        Every occurrence of a resolved credential or the stream key is replaced,
-        so neither can reach a log line even though both are in the real argv.
+        Handles both spellings: secrets in a normal argument, and the ``-/i`` form
+        whose *argument is a path*, not the credential. In the latter case there is
+        nothing to redact -- which is the point of the M3-B change -- and this
+        method must not invent a secret where none is present.
         """
         out: list[str] = []
         for arg in self.argv:
@@ -177,34 +277,34 @@ def _with_credentials(url: str, username: str | None,
         raise CommandBuildError("source_scheme")
 
 
-def _stream_key_of(url: str) -> str | None:
-    """The stream key from an RTMPS ingest URL (the last path segment), if any.
+def _split_output(ingest_url: str) -> tuple[str, str, str]:
+    """Split an RTMP(S) ingest URL into (base, app, playpath) for the key-option form.
 
-    YouTube's ingest URL is ``rtmps://a.rtmps.youtube.com/live2/<KEY>``. The key
-    is returned only so the command can redact it from logs; it is never stored in
-    an :class:`IngestCommand` attribute of its own, so no accessor can surface it.
+    ``rtmps://host/live2/<KEY>`` splits into base ``rtmps://host``, app ``live2``
+    and playpath ``<KEY>``. The base is the only part that ever reaches the argv;
+    the playpath (the stream key) is handed to FFmpeg through the input-file
+    mechanism instead, so it cannot be read from ``/proc/<pid>/cmdline``.
     """
-    try:
-        parts = urlsplit(str(url or ""))
-    except ValueError:
-        return None
+    parts = urlsplit(ingest_url)
     path = (parts.path or "").strip("/")
-    if not path:
-        return None
-    return path.rsplit("/", 1)[-1] or None
+    app, _, key = path.rpartition("/")
+    return f"{parts.scheme}://{parts.hostname}" + (
+        f":{parts.port}" if parts.port else ""), app, key
 
 
 def build_command(camera_id: str, source: dict, *,
                   output: str = OUTPUT_RTMPS,
                   ingest_url: str | None = None,
-                  ffmpeg_bin: str | None = None) -> IngestCommand:
+                  ffmpeg_bin: str | None = None,
+                  secret_store: SecretFileStore | None = None) -> IngestCommand:
     """Build the video-only ingest command for one camera, or raise.
 
     ``ingest_url`` is the server-side RTMPS destination (its stream key is
-    resolved by the caller from a secret reference). It is a parameter so tests
-    can pass a placeholder; production resolves it from the private store. When it
-    is absent the command is refused -- a stream with no destination would only
-    waste a camera connection.
+    resolved by the caller from a secret reference). ``secret_store`` is where the
+    credential-bearing input URL and the stream key are written so FFmpeg reads
+    them from a file rather than the command line (the M3-B L3 fix). Without a
+    store the command is refused: shipping the credential in argv is exactly what
+    this milestone removes.
     """
     if not isinstance(source, dict) or not source.get("url"):
         raise CommandBuildError("source_absent")
@@ -248,6 +348,25 @@ def build_command(camera_id: str, source: dict, *,
 
     input_url = _with_credentials(url, username, password)
 
+    # The credential must not sit in argv. Write the whole input URL to a private
+    # file and have FFmpeg read it with `-/i`. When the source needs no credential
+    # the URL is public, but we still route it through the file for one code path
+    # (and so an operator cannot tell a credentialed camera from a public one by
+    # watching argv). A missing store fails closed: no store means no safe way to
+    # pass the input.
+    if secret_store is None:
+        raise CommandBuildError("secret_store_unavailable")
+    try:
+        input_path = secret_store.write(camera_id, input_url)
+    except OSError:
+        # Never include the path or the URL in the reason; it is a fixed label.
+        raise CommandBuildError("secret_store_unavailable")
+
+    # The stream key is the last path segment; it is passed as an *option value
+    # read from the same private file* (`-/rtmp_playpath`), whose only visible
+    # argv form is a path. The base URL in the position argument carries no key.
+    base, app, key = _split_output(ingest_url)
+
     argv = [
         ffmpeg_bin or "ffmpeg",
         "-hide_banner",
@@ -256,7 +375,9 @@ def build_command(camera_id: str, source: dict, *,
         "-rtsp_transport", _rtsp_transport(url),
         # A bounded connect/read so a dead camera cannot pin a worker slot.
         "-rw_timeout", "15000000",
-        "-i", input_url,
+        # `-/i` = "-i, but read the argument from this file". Documented in
+        # ffmpeg(1) under "argument from file"; the value is taken verbatim.
+        "-/i", input_path,
         # Video only, twice over: -an drops any audio, and the explicit map takes
         # exactly the first video stream and nothing else.
         "-an",
@@ -265,20 +386,31 @@ def build_command(camera_id: str, source: dict, *,
         "-preset", "veryfast",
         "-tune", "zerolatency",
         # A single live output. No `-f segment`, no tee, no file path: nothing here
-        # can record to disk.
+        # can record to disk. `-f flv` names the RTMP muxer, which is the only
+        # output format this builder emits.
         "-f", "flv",
-        ingest_url,
+        "-rtmp_app", app,
     ]
+    if key:
+        try:
+            key_path = secret_store.write(camera_id, key, "key")
+        except OSError:
+            # The input file was already written; do not leave a credential file
+            # behind just because the key half failed.
+            secret_store.remove(camera_id)
+            raise CommandBuildError("secret_store_unavailable")
+        argv += ["-/rtmp_playpath", key_path]
+    argv.append(base)
 
     # A minimal environment, not the web process's own. A media child has no
     # reason to see WX_ADMIN_TOKEN, the Stripe keys or anything else this process
     # holds: inheriting them would widen a compromised demuxer's reach for free.
     # Only the variables a media tool genuinely needs are passed through.
     env = {k: os.environ[k] for k in _ENV_PASSTHROUGH if k in os.environ}
-    secrets = tuple(s for s in (password, _stream_key_of(ingest_url)) if s)
+    secrets = tuple(s for s in (password, key) if s)
     summary = (f"{argv[0]} in={redact_url(url)} out={redact_url(ingest_url)} "
                f"video-only")
-    return IngestCommand(argv, env, summary, secrets)
+    return IngestCommand(argv, env, summary, secrets, secret_file=input_path)
 
 
 def resolved_source(camera_id: str) -> dict:

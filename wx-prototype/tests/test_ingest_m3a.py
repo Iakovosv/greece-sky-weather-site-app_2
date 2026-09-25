@@ -75,6 +75,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("WX_CAMERA_ILIOUPOLI_PASS", CAM_PASS)
     monkeypatch.setenv("WX_CAMERA_INGEST_REF", "WX_CAMERA_INGEST_URL")
     monkeypatch.setenv("WX_CAMERA_INGEST_URL", INGEST_URL)
+    monkeypatch.setenv("WX_STREAM_SECRET_DIR", str(tmp_path / "stream-secrets"))
     monkeypatch.setenv("WX_CAMERAS", json.dumps([_cam()]))
     monkeypatch.setenv("WX_CAMERA_SOURCES", json.dumps([_source()]))
     _reload()
@@ -223,9 +224,14 @@ def test_unknown_backend_refused_through_request_start(env, monkeypatch):
 
 # =========================================================== 2. command builder
 
-def _cmd():
+def _store():
+    return ic.SecretFileStore(os.environ["WX_STREAM_SECRET_DIR"])
+
+
+def _cmd(**kw):
     return ic.build_command("ilioupoli", ic.resolved_source("ilioupoli"),
-                            ingest_url=INGEST_URL, ffmpeg_bin="ffmpeg")
+                            ingest_url=INGEST_URL, ffmpeg_bin="ffmpeg",
+                            secret_store=_store(), **kw)
 
 
 def test_command_is_video_only(env):
@@ -237,9 +243,45 @@ def test_command_is_video_only(env):
     assert "-acodec" not in joined and "-c:a" not in joined
 
 
+def test_command_keeps_credentials_out_of_argv(env):
+    """M3-B / L3: the RTSP credential and the stream key are not command-line args.
+
+    Mutation test: reverting to `-i <url with userinfo>` (or a positional ingest
+    URL carrying the key) puts them back in argv -- which is what any local user
+    reads from /proc/<pid>/cmdline -- and this fails.
+    """
+    cmd = _cmd()
+    joined = " ".join(cmd.argv)
+    assert CAM_PASS not in joined
+    assert "viewer@" not in joined and "viewer:" not in joined
+    assert STREAM_KEY not in joined
+    # The input is read from a file via FFmpeg's "argument from file" form.
+    assert "-i" not in cmd.argv
+    assert "-/i" in cmd.argv
+    # ...and the destination is the bare host; app and key are options.
+    assert cmd.argv[-1] == "rtmps://ingest.example.com"
+    assert cmd.argv[cmd.argv.index("-rtmp_app") + 1] == "live2"
+    assert "-/rtmp_playpath" in cmd.argv
+
+
+def test_secret_files_hold_the_real_values_0600(env):
+    import stat
+    cmd = _cmd()
+    assert cmd.secret_file is not None
+    with open(cmd.secret_file, encoding="utf-8") as fh:
+        assert fh.read() == f"rtsp://viewer:{CAM_PASS}@{CAM_HOST}:554/Streaming/Channels/101"
+    mode = stat.S_IMODE(os.stat(cmd.secret_file).st_mode)
+    assert mode == 0o600
+    mode_dir = stat.S_IMODE(os.stat(os.path.dirname(cmd.secret_file)).st_mode)
+    assert mode_dir == 0o700
+    key_file = _store().path_for("ilioupoli", "key")
+    with open(key_file, encoding="utf-8") as fh:
+        assert fh.read() == STREAM_KEY
+
+
 def test_command_has_no_recording_output(env):
     cmd = _cmd()
-    assert cmd.argv[-1] == INGEST_URL          # exactly one output: the ingest
+    assert cmd.argv[-1] == "rtmps://ingest.example.com"   # one output: the ingest
     assert cmd.argv.count("-f") == 1
     assert cmd.argv[cmd.argv.index("-f") + 1] == "flv"
     joined = " ".join(cmd.argv)
@@ -262,29 +304,39 @@ def test_command_rejects_credentials_in_url(env, monkeypatch):
     importlib.reload(cams)
     with pytest.raises(ic.CommandBuildError) as e:
         ic.build_command("ilioupoli", {"url": "rtsp://user:pw@host/stream"},
-                         ingest_url=INGEST_URL)
+                         ingest_url=INGEST_URL, secret_store=_store())
     assert e.value.reason == "source_scheme"
 
 
 def test_command_rejects_audio_source(env):
     with pytest.raises(ic.CommandBuildError) as e:
         ic.build_command("ilioupoli", {"url": RTSP, "audio": True},
-                         ingest_url=INGEST_URL)
+                         ingest_url=INGEST_URL, secret_store=_store())
     assert e.value.reason == "audio_not_allowed"
 
 
 def test_command_requires_output(env):
     with pytest.raises(ic.CommandBuildError) as e:
         ic.build_command("ilioupoli", ic.resolved_source("ilioupoli"),
-                         ingest_url=None)
+                         ingest_url=None, secret_store=_store())
     assert e.value.reason == "no_output"
+
+
+def test_command_without_secret_store_fails_closed(env):
+    # Mutation test: allowing a None store would mean building an `-i <url>`
+    # command line with the credential in it.
+    with pytest.raises(ic.CommandBuildError) as e:
+        ic.build_command("ilioupoli", ic.resolved_source("ilioupoli"),
+                         ingest_url=INGEST_URL)
+    assert e.value.reason == "secret_store_unavailable"
 
 
 def test_command_missing_credential_fails_closed(env, monkeypatch):
     monkeypatch.delenv("WX_CAMERA_ILIOUPOLI_PASS", raising=False)
     importlib.reload(cams)
     with pytest.raises(ic.CommandBuildError) as e:
-        ic.build_command("ilioupoli", _source(), ingest_url=INGEST_URL)
+        ic.build_command("ilioupoli", _source(), ingest_url=INGEST_URL,
+                         secret_store=_store())
     assert e.value.reason == "credential_missing"
 
 
@@ -297,9 +349,12 @@ def test_resolved_source_absent(env):
 def test_injected_credential_is_percent_encoded(env):
     cmd = ic.build_command(
         "ilioupoli", {"url": RTSP, "username": "user@x", "password": "p:w/d"},
-        ingest_url=INGEST_URL)
-    inp = cmd.argv[cmd.argv.index("-i") + 1]
-    assert "user%40x:p%3Aw%2Fd@" in inp
+        ingest_url=INGEST_URL, secret_store=_store())
+    # The encoding now lands in the secret file (FFmpeg reads it verbatim) rather
+    # than in argv.
+    assert "-/i" in cmd.argv
+    with open(cmd.secret_file, encoding="utf-8") as fh:
+        assert "user%40x:p%3Aw%2Fd@" in fh.read()
 
 
 def test_summary_redacts_url_path_and_credentials(env):
@@ -315,11 +370,12 @@ def test_summary_redacts_url_path_and_credentials(env):
 def test_safe_argv_redacts_every_secret(env):
     cmd = _cmd()
     safe = " ".join(cmd.safe_argv())
-    # Mutation test: remove the redaction list and both leak here.
     assert CAM_PASS not in safe
     assert STREAM_KEY not in safe
-    # ...while the real argv still carries them (FFmpeg needs the credential).
-    assert CAM_PASS in " ".join(cmd.argv)
+    # The real argv does not carry them either any more (M3-B) -- they live only
+    # in the 0600 secret files -- so refusal-by-absence and redaction agree.
+    real = " ".join(cmd.argv)
+    assert CAM_PASS not in real and STREAM_KEY not in real
 
 
 def test_scrub_removes_secrets_from_stderr_text(env):
@@ -356,8 +412,161 @@ def test_child_env_withholds_project_secrets(env, monkeypatch):
     assert set(cmd.env) <= set(ic._ENV_PASSTHROUGH)
 
 
-# ======================================================== 3. worker start/stop
+# ==================================================== 2b. M3-B output lock-down
 
+def test_output_app_and_key_are_split_not_arbitrary(env):
+    """The destination the builder emits is derived only from the resolved URL.
+
+    Mutation test: emit the ingest URL as a positional argument (as M3-A did) and
+    the stream key is back in argv; accept an arbitrary destination and this test
+    cannot pin the shape.
+    """
+    cmd = _cmd()
+    base, app, key = ic._split_output(INGEST_URL)
+    assert base == "rtmps://ingest.example.com"
+    assert app == "live2" and key == STREAM_KEY
+    assert cmd.argv[-1] == base
+    # No argument anywhere is an arbitrary absolute URL from a caller: the only
+    # URL-shaped positional is the host the server itself resolved.
+    assert [a for a in cmd.argv if a.startswith("rtmps://")] == [base]
+
+
+def test_secret_store_refuses_symlinked_directory(env, tmp_path):
+    # A symlinked directory would redirect the credential to wherever it points.
+    real = tmp_path / "real"; real.mkdir()
+    link = tmp_path / "link"; os.symlink(real, link)
+    store = ic.SecretFileStore(str(link))
+    with pytest.raises(OSError):
+        store.write("ilioupoli", "secret")
+    assert not any(real.iterdir())
+
+
+def test_secret_store_replaces_a_planted_symlink_without_following_it(env, tmp_path):
+    # A symlink at the *file* path must not let an attacker make FFmpeg read a
+    # world-readable file: os.replace swaps the link for the real 0600 file, and
+    # the victim keeps its original contents either way.
+    store = ic.SecretFileStore(str(tmp_path / "d"))
+    os.makedirs(store.directory, mode=0o700, exist_ok=True)
+    victim = tmp_path / "victim.txt"; victim.write_text("original")
+    link = store.path_for("ilioupoli")
+    os.symlink(victim, link)
+    store.write("ilioupoli", "secret")
+    assert victim.read_text() == "original"
+    assert not os.path.islink(store.path_for("ilioupoli"))
+
+
+def test_secret_store_filename_is_not_a_path(env):
+    store = ic.SecretFileStore("/tmp/does-not-matter")
+    p = store.path_for("../../etc/passwd")
+    assert os.path.basename(p) == "etcpasswd-in.url"
+    assert ".." not in p and os.sep not in os.path.basename(p)
+
+
+def test_stop_removes_the_secret_files(env):
+    async def go():
+        f = FakeFactory(default="stays")
+        w = _worker(f)
+        await sc.request_start("ilioupoli", worker=w)
+        store = w.secret_store
+        assert os.path.exists(store.path_for("ilioupoli"))
+        await sc.request_stop("ilioupoli", worker=w)
+        # The credential file must not outlive the stream.
+        assert not os.path.exists(store.path_for("ilioupoli"))
+        assert not os.path.exists(store.path_for("ilioupoli", "key"))
+    asyncio.run(go())
+
+
+def test_spawn_failure_leaves_no_secret_file(env):
+    """A failed spawn must not strand the credential file the builder wrote."""
+    async def go():
+        f = FakeFactory(behaviours=["spawn_fail"])
+        w = _worker(f)
+        r = await sc.request_start("ilioupoli", worker=w)
+        assert r["ok"] is False
+        store = w.secret_store
+        assert not os.path.exists(store.path_for("ilioupoli"))
+        assert not os.path.exists(store.path_for("ilioupoli", "key"))
+    asyncio.run(go())
+
+
+def test_supervisor_exit_removes_the_secret_files_on_crash_loop(env, monkeypatch):
+    async def go():
+        monkeypatch.setattr(iw, "MAX_CONSECUTIVE_RESTARTS", 1)
+        f = FakeFactory(default="crash_now")
+        w = _worker(f, launch_grace_s=0.0,
+                    sleep=lambda s: asyncio.sleep(0))
+        await sc.request_start("ilioupoli", worker=w)
+        store = w.secret_store
+        # The supervisor's terminal path (here: crash-loop exhausted) must remove
+        # the credential files. Wait for the removal itself -- the property under
+        # test -- rather than for a state write that precedes the cleanup.
+        await _wait_until(lambda: not os.path.exists(store.path_for("ilioupoli")))
+        assert not os.path.exists(store.path_for("ilioupoli"))
+        assert not os.path.exists(store.path_for("ilioupoli", "key"))
+    asyncio.run(go())
+
+
+def test_real_worker_activation_off_means_no_process(env, monkeypatch):
+    """WX_STREAM_ENABLED=0 refuses at the endpoint before any worker runs.
+
+    Mutation test: drop the `stream_enabled` guard in the start endpoint and a
+    real backend would be reached with the feature off.
+    """
+    monkeypatch.setenv("WX_STREAM_ENABLED", "0")
+    monkeypatch.setenv("WX_ADMIN_TOKEN", "operator-secret")
+    import app as app_module
+    from fastapi.testclient import TestClient
+    c = TestClient(app_module.app)
+    h = {"X-WX-Admin": "operator-secret"}
+    r = c.post("/api/admin/streams/ilioupoli/start", headers=h)
+    # The endpoint refuses with 503 when the control plane is off, so no process
+    # is ever spawned and live_status stays false.
+    assert r.status_code == 503
+    assert c.get("/api/cameras/ilioupoli").json()["live_status"]["running"] is False
+
+
+# ==================================================== 2c. deploy readiness probe
+
+def test_activation_ready_reports_mock_backend_without_touching_disk(env, monkeypatch):
+    monkeypatch.setenv("WX_STREAM_BACKEND", "mock")
+    importlib.reload(sc)
+    assert sc.activation_ready() == {"ready": False, "reason": "backend_not_real"}
+
+
+def test_activation_ready_needs_ffmpeg_and_a_destination(env, monkeypatch):
+    monkeypatch.setenv("WX_STREAM_BACKEND", "real")
+    monkeypatch.setenv("WX_CAMERA_INGEST_REF", "WX_CAMERA_INGEST_URL")
+    monkeypatch.delenv("WX_CAMERA_INGEST_URL", raising=False)
+    importlib.reload(sc)
+    # The fixture has a startable camera but no real ingest destination, so a
+    # start would be refused: `ready` is false and the camera is counted, not
+    # named.
+    r = sc.activation_ready()
+    assert r["ready"] is False
+    assert "ilioupoli" not in json.dumps(r)
+    # Give it a destination and, if FFmpeg happens to be present, it is ready.
+    monkeypatch.setenv("WX_CAMERA_INGEST_URL", INGEST_URL)
+    importlib.reload(sc)
+    r2 = sc.activation_ready()
+    assert set(r2) <= {"ready", "reason", "unconfigured_cameras"}
+    assert INGEST_URL not in json.dumps(r2) and STREAM_KEY not in json.dumps(r2)
+
+
+def test_health_streams_block_exposes_readiness_but_no_secret(env, monkeypatch):
+    monkeypatch.setenv("WX_STREAM_BACKEND", "real")
+    monkeypatch.setenv("WX_STREAM_ENABLED", "1")
+    monkeypatch.setenv("WX_ADMIN_TOKEN", "operator-secret")
+    import app as app_module
+    from fastapi.testclient import TestClient
+    c = TestClient(app_module.app)
+    r = c.get("/api/health")
+    assert r.status_code == 200
+    body = r.json()["streams"]
+    assert "ready" in body
+    assert INGEST_URL not in r.text and STREAM_KEY not in r.text and CAM_PASS not in r.text
+
+
+# ======================================================== 3. worker start/stop
 def test_real_worker_start_returns_starting(env):
     async def go():
         f = FakeFactory(default="stays")

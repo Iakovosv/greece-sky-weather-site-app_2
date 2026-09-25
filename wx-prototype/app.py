@@ -4212,10 +4212,17 @@ async def health():
         "camera_lifecycle": lifecycle.summary(),
         # Stream control plane: whether it is on, which backend, the cap and how
         # many streams are running. Counts and names only -- no ids, no commands.
+        # `ready` is the whole activation suite, not just the flag: the real
+        # backend needs FFmpeg plus a resolvable ingest destination AND a private
+        # secret dir, so a deploy can tell "enabled but not actually ready to
+        # stream" from "running" without SSH. It stays a set of booleans and a
+        # requirement count -- no path, host or key.
         "streams": {"enabled": config.stream_enabled(),
                     "backend": config.stream_backend(),
                     "max_active": config.stream_max_active(),
-                    "active": streams.active_count() if config.stream_enabled() else 0},
+                    "active": streams.active_count() if config.stream_enabled() else 0,
+                    "ready": streams.activation_ready() if config.stream_enabled()
+                    else {"ready": False, "reason": "disabled"}},
         "data_sources": ["GFS (public domain)", "ICON-EU DWD (CC BY 4.0)",
                          "ECMWF open data (CC BY 4.0, best-effort)",
                          "Photon geocoding (OSM)", "OpenTopoData DEM"],

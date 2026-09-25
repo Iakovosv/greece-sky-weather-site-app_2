@@ -105,7 +105,11 @@ ERROR_REASONS = frozenset({"launch_failed", "worker_unavailable", "timeout",
                            # worker's own text.
                            "source_absent", "credential_missing", "audio_not_allowed",
                            "no_output", "host_not_allowlisted", "source_scheme",
-                           "not_startable", "backend_unavailable"})
+                           "not_startable", "backend_unavailable",
+                           # M3-B: the private secret directory could not be used,
+                           # so the credential could not be kept out of argv. Fail
+                           # closed rather than fall back to a command line.
+                           "secret_store_unavailable"})
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stream_state (
@@ -223,6 +227,18 @@ def worker_for_backend() -> StreamWorker:
         return _REAL_WORKER
     log.error("unknown stream backend %r; stream starts will be refused", backend)
     return _UnavailableWorker(backend)
+
+
+def activation_ready() -> dict:
+    """Deploy-readiness probe for the real ingest backend. Delegates to the worker.
+
+    Kept here so ``/api/health`` and the admin surface have one import, and so the
+    control plane stays the only module the app talks to for stream state.
+    """
+    if (config.stream_backend() or "mock").strip().lower() != "real":
+        return {"ready": False, "reason": "backend_not_real"}
+    import ingest_worker
+    return ingest_worker.activation_ready()
 
 
 def current_real_worker():
