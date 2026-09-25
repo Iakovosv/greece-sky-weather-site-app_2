@@ -17,16 +17,20 @@ infrastructure work on the same branch.
 | Item | Value |
 |---|---|
 | Branch | `camera-infrastructure` |
-| Current commit | recorded in the chat checkpoint at the end of this session |
-| Previous commit | `1769de29fdad3c4b2613d8c3a70da11b44772817` (`1769de2`) |
+| Latest W1 commit | `21c033f` — the copy fix; **local only, not pushed** |
+| Preceding checkpoint | `4027075` — completed PRO Ensemble (what `origin/camera-infrastructure` still points at) |
 | Earlier milestone commits | `4fd4906` (first ensemble summary), `da8cdf7` (inline-script fix), `898116a` (camera secret handling) |
-| Production baseline | `d0c088576d7233309c216b72746cd2102abf58cd` (`d0c0885`) |
-| `origin/main` | `5f40288d1f47f2bc3bc1eb302137689ea6d2a1ec` — **unchanged** |
+| Regression audit | `1769de2` |
+| Production baseline | `d0c0885` |
+| `origin/main` | `5f40288` — **unchanged** |
 | `production-hardening` / `origin/production-hardening` | `d0c0885` — **unchanged** |
+| `origin/camera-infrastructure` | `4027075` — local branch is **ahead by the W1 commit(s), not pushed** |
 
-**Working tree is clean.** `HEAD` and `origin/camera-infrastructure` are
-synchronized (`ahead/behind = 0 0`). All pushes were fast-forward; no merge,
-rebase, amend or force push was performed.
+**Working tree is clean.** The W1 copy fix (`21c033f`) and this handoff update are
+committed locally and **have not been pushed**; `origin/camera-infrastructure`
+still points at `4027075`. Run `git log --oneline -3` for the exact tip — this
+document is itself inside one of those W1 commits, so it does not hard-code its
+own hash. No merge, rebase, amend or force push was performed.
 
 Work is fully isolated on `camera-infrastructure`; `main` and
 `production-hardening` were not touched. No production or VPS change was made.
@@ -44,8 +48,10 @@ Listed oldest → newest (camera work precedes the ensemble work):
   mean/spread line inside the agreement block.
 - **Inline-script fix** (`da8cdf7`) — shipping blocker; see §9.
 - **Regression audit** (`1769de2`) — read-only; produced W1–W4, see §10.
-- **PRO Ensemble Forecasts, completed** (this session) — multi-variable series in
+- **PRO Ensemble Forecasts, completed** (`4027075`) — multi-variable series in
   its own PRO section; see §3–§8.
+- **W1 copy fix** (`21c033f`) — the deterministic agreement copy no longer claims
+  three models; copy only, no logic. See §15.
 
 ---
 
@@ -353,19 +359,25 @@ Recorded in substance from the `1769de2` read-only audit. **None was introduced
 by the ensemble work.**
 
 **W1 — UI says «Σύγκριση 3 μοντέλων» while the spread uses 2 models.**
-*(pre-existing, baseline)*
+*(pre-existing, baseline — **FIXED** in `21c033f`, copy only)*
 - Point: `temperature_series_for_agreement(gfs_rows, icon, ec)` — the `ec`
   (ECMWF) parameter is **accepted but never used**. The series is
   `{"GFS", "ICON-EU"}`.
-- Result: `agreement.models == 2`, while the FREE unlocks text says «Σύγκριση
+- Result: `agreement.models == 2`, while the FREE unlocks text said «Σύγκριση
   **3** μοντέλων». ECMWF is used in `model_grid`, not in the spread.
 - Provenance: `c396fb9`, baseline; also present in `d0c0885`. **Not** introduced
   by the recent commits.
 - Severity: low (2 is not a wrong value — it is honestly 2 models), but the copy
-  promises 3. The `agreement()` comment also still says "Single source of truth
-  for **reliability**", wording worth revisiting alongside the honesty rules added
-  for the ensemble.
-- **Not fixed this session.**
+  promised 3.
+- **Fixed in `21c033f` by correcting the copy only.** Wording now reads
+  «Σύγκριση μοντέλων» (no model count) and the FREE locked body states the real
+  pair («απόκλιση GFS και ICON-EU»). ECMWF was **not** added to the spread, the
+  `agreement()` / `temperature_series_for_agreement()` bodies and the 1.5/3.0
+  thresholds are **unchanged**, and `agreement.docstring` («Single source of truth
+  for **reliability**») is deliberately left for a later pass — see §15.
+- Note: `agreement.text` was already `'Συμφωνία μοντέλων'`, which is why the
+  rendered verdict line never claimed a count. The claim lived in the surrounding
+  copy (unlocks, upsell, locked body, README).
 
 **W2 — `free(): invalid pointer` / `double free` → SIGABRT (exit 134) at process
 shutdown.** *(environmental, baseline)*
@@ -394,15 +406,29 @@ the audit script; the correct endpoint is `/api/health`, verified 200.)*
 
 ---
 
-## 11. This session's commit
+## 11. Session commits
+
+### 11a. PRO Ensemble completion — `4027075`
 
 | Item | Value |
 |---|---|
 | Branch | `camera-infrastructure` |
-| Commit | recorded in the chat checkpoint at the end of this session |
+| Commit | `4027075023d115d914d1013b2b73d2259103dd8f` (`4027075`) |
 | Parent | `1769de2` |
-| Contents | the 6 files in §3 plus this handoff |
+| Contents | 7 files: `AGENTS.md`, `LICENSES.md`, `PROJECT_HANDOFF.md`, `README.md`, `app.py`, `ensemble.py`, `tests/test_ensemble.py` |
 | Remote | pushed to `origin/camera-infrastructure` (fast-forward only) |
+
+### 11b. W1 copy fix — `21c033f` (local only, not pushed)
+
+| Item | Value |
+|---|---|
+| Branch | `camera-infrastructure` |
+| Commit | `21c033f08a2df5ed49e4c1f1531908c6156e3ed2` (`21c033f`) |
+| Parent | `4027075` |
+| Subject | `fix: stop claiming three models in the deterministic agreement copy` |
+| Contents | 4 files: `README.md`, `app.py`, `entitlements.py`, `legal.py` (22 insertions, 21 deletions, copy only) |
+| Remote | **not pushed**; `origin/camera-infrastructure` is still `4027075` |
+| Also contains | this `PROJECT_HANDOFF.md` update (§1, §2, §10, §11, new §15) |
 
 No commit, push, merge, rebase, amend or force push touched `main`,
 `production-hardening`, or production. No VPS change.
@@ -417,6 +443,11 @@ A GitHub personal access token was pasted into the chat during this work, and an
 earlier token is also present in plaintext in the local `origin` remote URL.
 **Both must be revoked and rotated.** A token that has passed through chat
 history must be treated as compromised regardless of scope.
+
+**Update (`21c033f` session): a further token was pasted into chat again.** It was
+**not used** — the W1 commit was made with the environment's own configured
+credential. It must be revoked like the others. The lesson repeats: never paste a
+token into chat; use the credential already configured in the environment.
 
 1. Revoke the pasted token: GitHub → Settings → Developer settings → Personal
    access tokens → Revoke.
@@ -448,3 +479,71 @@ No token value is recorded in this document, and none should ever be committed.
   (not even inside a comment).
 - The ensemble is never presented as forecast reliability or confidence.
 - No token, secret or credential in the repository.
+
+---
+
+## 15. W1 copy fix — what changed and how to resume
+
+Committed as `21c033f`, **local only, not pushed**. Read this before touching the
+agreement copy again.
+
+### What was wrong
+
+The deterministic agreement card is honest about its number: `agreement.text` is
+`'Συμφωνία μοντέλων'` and `agreement.models` is **2**, because
+`temperature_series_for_agreement()` builds `{"GFS", "ICON-EU"}` and ignores its
+`ec` argument. The **copy around it promised three models** (the FREE unlocks
+line said «Σύγκριση **3** μοντέλων»). Not a numeric bug — the number was right, the
+words were not.
+
+### What changed (4 files, copy only)
+
+| File | Change |
+|---|---|
+| `app.py` | Expert locked body, FREE upsell, in-page CTA, modal subtitle: «Σύγκριση μοντέλων» (no count); locked body now says «απόκλιση GFS και ICON-EU»; ensemble note says «τα ντετερμινιστικά μοντέλα» |
+| `entitlements.py` | PRO feature card now «Σύγκριση μοντέλων» |
+| `legal.py` | corresponding «Σύγκριση μοντέλων» |
+| `README.md` | agreement section and three dependent GEFS-section references updated |
+
+The `model_grid` subtitle «GFS · ICON · ECMWF» is **kept** — the grid genuinely
+has three models.
+
+### What did NOT change
+
+- `agreement()` and `temperature_series_for_agreement()` bodies — byte-identical.
+- The `1.5` / `3.0` thresholds.
+- ECMWF was **not** added to the spread.
+- FREE 72 h / PRO 240 h, entitlements, billing, caching, notifications.
+- Comments and the unused `ec` parameter (out of scope on purpose).
+
+### Open follow-ups from W1
+
+- `agreement()` docstring still says "Single source of truth for **reliability**".
+  Revisit alongside the ensemble honesty rules.
+- English architecture comments still describe the grid as "three deterministic
+  models" (accurate for the grid, not for the spread); left as-is by decision.
+
+### Fragile spot — no committed test guards this wording yet
+
+No `tests/*.py` asserts the agreement / unlocks wording (verified: zero matches
+for «Σύγκριση» / «Συμφωνία» under `tests/`, and only one loose assertion,
+`test_ux_patch2.py:131`, checks `unlocks[0].lower()`). The W1 change was verified
+with an ad-hoc Node harness that executed the real render functions and failed 12
+assertions against the pre-change file — but that harness was **deleted** after
+use. So a future edit could silently reintroduce a "3 models" claim.
+
+If this copy is likely to change again, add a small Python test that asserts the
+rendered strings (`/api/plans` unlocks, the FREE locked body, the upsell CTA). It
+was not added here to keep the commit to the approved copy-only scope — a test
+file is a separate, reviewable change.
+
+### To resume
+
+```text
+1. Branch camera-infrastructure, HEAD 21c033f (local), origin still 4027075.
+2. Working tree clean. Nothing to unstage.
+3. To push this commit later: git push origin camera-infrastructure
+   (fast-forward; origin/camera-infrastructure == its parent 4027075).
+4. To undo it before pushing: git reset --hard 4027075
+5. To undo it after pushing:  git revert 21c033f
+```
