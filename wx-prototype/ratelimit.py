@@ -58,6 +58,14 @@ STATION = Limits(rate=1.0, burst=30)
 # tight enough that the endpoint cannot be used to write rows without bound —
 # which is the one thing here an anonymous caller can grow.
 ANALYTICS = Limits(rate=0.5, burst=20)
+# Camera snapshot upstream fetches. This bucket exists to protect the *upstream
+# source*, not the reader: it is consulted only on the cache-miss path (see
+# `snapshots.get_snapshot`), keyed per (camera, client). A cache hit never spends
+# a token, so N viewers of one camera still cost one upstream fetch and none of
+# them is throttled by the others. A viewer reloading the card is served from the
+# shared cache for the whole TTL, so reaching this bucket at all needs a cold or
+# expired frame — the rate is a backstop against a loop, not a per-view quota.
+CAMERA_SNAPSHOT = Limits(rate=0.2, burst=6)
 # Notification preference writes: a human toggles these. Tight, because each one
 # writes a row and the settings screen is small.
 NOTIFY_WRITE = Limits(rate=0.25, burst=6)

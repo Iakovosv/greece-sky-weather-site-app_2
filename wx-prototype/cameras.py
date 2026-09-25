@@ -86,8 +86,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import urlsplit
+
+import config
 
 log = logging.getLogger("wx.cameras")
 
@@ -117,6 +120,14 @@ DEFAULT_INTERVAL = 5
 
 _ALLOWED_SNAPSHOT_SCHEMES = ("http", "https")
 _SOURCE_SCHEMES = ("rtsp", "rtsps", "http", "https")
+
+# A camera id is an opaque public identifier that ends up in a URL path
+# (`/api/cameras/<id>/snapshot`) and in an HTML element id, so it is constrained
+# to a conservative shape rather than accepted as free text. Lowercase letters,
+# digits, hyphen and underscore; 1-64 chars; must start with a letter or digit.
+# This keeps an id stable and URL-safe, and stops a config typo from producing an
+# id that a route, an element id, or a log line would have to quote defensively.
+_CAMERA_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 # --------------------------------------------------------------- URL safety
@@ -160,6 +171,35 @@ def _valid_snapshot_url(value) -> str | None:
 
 # --------------------------------------------------------------- public model
 
+def _valid_camera_id(value) -> str | None:
+    """An id matching the constrained public shape, or None.
+
+    Deliberately strict: the id is the one piece of config that becomes a URL
+    segment and an element id, so a value that is not clearly safe is dropped
+    rather than escaped at every use site.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text if _CAMERA_ID_RE.match(text) else None
+
+
+def _finite_coord(key: str, value) -> float | None:
+    """A coordinate in range for its axis, or None.
+
+    A string latitude is a typo, not a number, and an out-of-range value is not a
+    coordinate. Both become None so a later map link or forecast call never has to
+    re-validate what config already handed it. The axis decides the bound: a
+    latitude of 100 is refused by `finite_lat` even though 100 is a valid longitude.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    check = config.finite_lat if key == "lat" else config.finite_lon
+    return number if check(number) else None
+
+
 def _sanitize(raw: dict, fallback_id: str) -> dict | None:
     """Keep only known keys, with types the UI can rely on.
 
@@ -167,21 +207,27 @@ def _sanitize(raw: dict, fallback_id: str) -> dict | None:
     with a missing name or a string latitude that breaks the map link. Crucially,
     only public-safe keys survive: private source material is not read here at
     all, so it cannot ride along in the returned dict.
+
+    Invalid configuration fails safe: an id that does not match the constrained
+    shape, or a coordinate that is not a finite in-range number, is dropped rather
+    than carried into a payload, a route or an element id. A camera whose id is
+    unusable is skipped entirely (``None``), so it cannot become an ambiguous
+    public entry.
     """
     if not isinstance(raw, dict):
         return None
     out: dict = {}
-    cid = str(raw.get("id") or fallback_id)
+    cid = _valid_camera_id(raw.get("id")) or _valid_camera_id(fallback_id)
     if not cid:
         return None
     out["id"] = cid
     out["name"] = str(raw.get("name") or cid)
     out["region"] = str(raw.get("region") or "")
     for key in ("lat", "lon"):
-        try:
-            out[key] = float(raw[key]) if raw.get(key) is not None else None
-        except (TypeError, ValueError):
-            out[key] = None
+        # A missing coordinate is fine (None); a present-but-unusable one is not a
+        # coordinate, so it becomes None rather than an out-of-range float that a
+        # map link or a forecast call would later have to re-validate.
+        out[key] = _finite_coord(key, raw.get(key)) if raw.get(key) is not None else None
     # A snapshot that is not a public http(s) URL is treated as "not set", so the
     # card says "not configured" instead of failing to load a bad address.
     out["snapshot"] = _valid_snapshot_url(raw.get("snapshot"))

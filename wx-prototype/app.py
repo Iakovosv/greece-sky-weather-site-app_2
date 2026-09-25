@@ -3161,6 +3161,9 @@ function openCamLive(id){
   const player=document.getElementById('camplayer-'+id);
   const bar=document.getElementById('camctl-'+id);
   if(!stage||!player||!bar) return;
+  // A second click while this camera is already playing must not build a second
+  // iframe: that would restart playback and leak the previous player.
+  if(player.classList.contains('playing')) return;
   track('sky_camera_live_opened');
   // Hide the snapshot stage (with its overlays) and give the player its own
   // region. The two are never visible at once, so nothing can sit over the embed.
@@ -3256,13 +3259,25 @@ function tickCameras(){
 }
 function toggleLive(){
   LIVE_ON=!LIVE_ON;
+  // The control is server-rendered, but guard it: a missing node must not throw
+  // and leave the ticker running with no way to pause it.
   const b=document.getElementById('cam-toggle');
-  b.classList.toggle('on',LIVE_ON);
-  document.getElementById('cam-toggle-label').textContent =
-    LIVE_ON? 'LIVE COVERAGE · παύση':'🔴 LIVE COVERAGE';
+  if(b) b.classList.toggle('on',LIVE_ON);
+  const label=document.getElementById('cam-toggle-label');
+  if(label) label.textContent = LIVE_ON? 'LIVE COVERAGE · παύση':'🔴 LIVE COVERAGE';
   if(CAM_TIMER){ clearInterval(CAM_TIMER); CAM_TIMER=null; }
   if(LIVE_ON){ CAM_LAST={}; tickCameras(); CAM_TIMER=setInterval(tickCameras, refreshTickMs()); }
 }
+/* The page can be hidden (a background tab, a phone locked) while the ticker runs.
+   Pausing the interval then is not a feature change — it just stops the browser
+   from fetching stills nobody is looking at, and it resumes on return. */
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden){
+    if(CAM_TIMER){ clearInterval(CAM_TIMER); CAM_TIMER=null; }
+  }else if(LIVE_ON&&!CAM_TIMER){
+    tickCameras(); CAM_TIMER=setInterval(tickCameras, refreshTickMs());
+  }
+});
 
 /* ---------- ERA5 verification ---------- */
 /* Runs at most once per selected point: each call costs a GFS range request per
@@ -4841,7 +4856,7 @@ async def camera_endpoint(camera_id: str):
 
 
 @app.get("/api/cameras/{camera_id}/snapshot")
-async def camera_snapshot_endpoint(camera_id: str):
+async def camera_snapshot_endpoint(camera_id: str, request: Request):
     """The latest still for a camera, fetched server-side from the trusted source.
 
     The request names a camera *id* only. The URL to fetch comes from the private
@@ -4859,11 +4874,26 @@ async def camera_snapshot_endpoint(camera_id: str):
 
     A caller cannot learn from the response whether a particular internal host
     exists, is reachable, or is slow.
+
+    The one non-generic answer is ``429``, and only when this caller asked for a
+    *new* upstream fetch too often. It uses the app's existing rate-limit contract
+    (the same body and ``Retry-After`` the middleware sends), because the generic
+    "unavailable" would invite an immediate retry and defeat the limit. A cache hit
+    never reaches this branch -- reading the shared frame is not an upstream fetch.
     """
+    client_key = ratelimit.client_key(request, config.trust_proxy_headers())
     try:
-        snap = await snapshots.get_snapshot(camera_id)
+        snap = await snapshots.get_snapshot(camera_id, client_key=client_key)
     except snapshots.UnknownCamera:
         raise HTTPException(404, "Η κάμερα δεν υπάρχει.")
+    except snapshots.FetchThrottled as e:
+        wait = max(1, int(e.retry_after + 0.999))
+        log.warning("snapshot fetch throttled: camera=%s key=%s retry_after=%ds",
+                    camera_id, client_key[:8], wait)
+        return JSONResponse(
+            {"detail": "Πολλά αιτήματα σε σύντομο χρόνο. Δοκίμασε ξανά σε λίγο.",
+             "retry_after": wait},
+            status_code=429, headers={"Retry-After": str(wait)})
     except (snapshots.NoSource, snapshots.SourceRejected):
         log.warning("snapshot unavailable: camera=%s reason=%s",
                     camera_id, "no source")
@@ -5477,6 +5507,20 @@ async def admin_promo_set_active(code: str, request: Request):
 async def admin_analytics(request: Request, days: int = Query(30, ge=1, le=365)):
     require_admin(request)
     return analytics.summary(days=days)
+
+
+@app.get("/api/admin/cameras")
+async def admin_cameras(request: Request):
+    """Per-camera snapshot diagnostics for an operator.
+
+    Gated by the same `X-WX-Admin` token as the promo and analytics admin routes,
+    and therefore closed (503) whenever `WX_ADMIN_TOKEN` is unset -- an
+    unconfigured deploy exposes no diagnostics surface. The payload carries no
+    source URL, host, credential or frame bytes; it is what an operator needs to
+    answer "which camera is stale, and how will the browser fetch it".
+    """
+    require_admin(request)
+    return snapshots.diagnostics()
 
 
 # ---------------------------------------------------------------- notifications (PRO)

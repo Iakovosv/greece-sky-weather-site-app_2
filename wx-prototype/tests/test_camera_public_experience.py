@@ -21,10 +21,25 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cameras as cams
+import ratelimit
 import snapshots as snap
 
 PUBLIC_HTTPS = "https://cam.example/latest.jpg"
 MOCK_YT_ID = "MOCKPUBLICID"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_limiter(monkeypatch):
+    """Rate limiting is off for the suite, and the fetch bucket is process-global.
+
+    Both are pinned per test so one scenario's misses cannot spend the next
+    scenario's tokens, and so the throttle is only consulted where a test asks
+    for it.
+    """
+    monkeypatch.setenv("WX_RATE_LIMIT_DISABLED", "1")
+    ratelimit.LIMITER.reset()
+    yield
+    ratelimit.LIMITER.reset()
 
 
 @pytest.fixture

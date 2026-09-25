@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cameras as cams
+import ratelimit
 import snapshots as snap
 
 SECRET_PASS = "unit-test-pass-123"
@@ -131,6 +132,21 @@ def test_literal_address_needs_no_resolution():
 
 
 # ============================================================ endpoint: camera id only
+
+@pytest.fixture(autouse=True)
+def _isolate_process_buckets(monkeypatch):
+    """The fetch throttle lives in a process-global dict.
+
+    A test that exercises the limiter must not leak spent tokens into the next
+    test, so every test here starts with an empty limiter. Rate limiting is
+    otherwise disabled for the suite (as elsewhere), so the limiter is only ever
+    consulted by the tests that opt in explicitly.
+    """
+    monkeypatch.setenv("WX_RATE_LIMIT_DISABLED", "1")
+    ratelimit.LIMITER.reset()
+    yield
+    ratelimit.LIMITER.reset()
+
 
 def _client():
     import app as app_module

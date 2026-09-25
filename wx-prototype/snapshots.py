@@ -48,6 +48,7 @@ import httpx
 
 import cameras as cams
 import config
+import ratelimit
 
 log = logging.getLogger("wx.snapshots")
 
@@ -103,6 +104,22 @@ class SourceRejected(SnapshotError):
 class FetchFailed(SnapshotError):
     """The upstream could not be reached, answered non-2xx, redirected, or was
     too slow / too large / not an image. One class for all of them on purpose."""
+
+
+class FetchThrottled(SnapshotError):
+    """This caller asked for a *new* upstream fetch too often for one camera.
+
+    Raised only on the cache-miss path (see :meth:`SnapshotCache.get_or_fetch`),
+    never for a cache hit -- a viewer reading the shared frame is not throttled.
+    It is a separate class from :class:`FetchFailed` so the endpoint can answer
+    with the app's existing rate-limit contract (429 + ``Retry-After``) rather
+    than the generic "unavailable" (503), which would invite an immediate retry
+    and so defeat the point of the limit.
+    """
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__("snapshot fetch throttled")
+        self.retry_after = retry_after
 
 
 # ------------------------------------------------------------------ results
@@ -413,6 +430,17 @@ def _normalise_content_type(value: str) -> str:
     return (value or "").split(";", 1)[0].strip().lower()
 
 
+def _is_image_content_type(value: str) -> bool:
+    """Whether a (possibly parameterised) Content-Type is a still we may serve.
+
+    One place decides "is this an image", so the streaming fetch and the mock
+    source cannot drift: both normalise the same way and consult the same
+    allowlist. A login page's ``text/html``, an API's ``application/json`` and an
+    error document are all refused here rather than being handed to a browser.
+    """
+    return _normalise_content_type(value) in ALLOWED_CONTENT_TYPES
+
+
 async def _fetch_http(url: str, kind: str, *, headers: dict | None,
                       extensions: dict | None) -> Snapshot:
     """One GET under all the limits, streamed so the byte cap is a real ceiling."""
@@ -429,8 +457,19 @@ async def _fetch_http(url: str, kind: str, *, headers: dict | None,
                     raise FetchFailed(f"upstream status {response.status_code}")
                 ctype = _normalise_content_type(
                     response.headers.get("content-type", ""))
-                if ctype not in ALLOWED_CONTENT_TYPES:
+                if not _is_image_content_type(ctype):
                     raise FetchFailed("content type is not an image")
+                # A declared length over the cap is refused before a byte is read,
+                # so a hostile upstream cannot make us buffer up to the cap first.
+                # A missing or unparseable length is not trusted: the streamed
+                # counter below is the real ceiling either way.
+                declared = response.headers.get("content-length")
+                if declared is not None:
+                    try:
+                        if int(declared) > MAX_BYTES:
+                            raise FetchFailed("declared body over the size cap")
+                    except ValueError:
+                        pass
                 body = bytearray()
                 async for chunk in response.aiter_bytes():
                     body.extend(chunk)
@@ -552,17 +591,37 @@ class SnapshotCache:
         return entry
 
     async def get_or_fetch(self, camera_id: str, source: SnapshotSource,
-                           now: float | None = None) -> Snapshot:
+                           now: float | None = None,
+                           client_key: str | None = None) -> Snapshot:
         """Return a fresh frame, fetching at most once for concurrent callers.
 
         The freshness re-check happens *inside* the lock: a caller that waited
         must see the frame the first caller just fetched, not fetch again.
+
+        The upstream-fetch throttle is charged here too, and only here: after the
+        in-lock freshness re-check, i.e. on the cache-miss path that is actually
+        about to reach the upstream. That placement is what keeps the three
+        concerns from fighting each other:
+
+        * a cache hit returns above this line and spends no token, so viewers
+          reading the shared frame are never throttled by each other;
+        * under a concurrent cold miss, the single-flight winner charges one
+          token and fetches, and every waiter that then sees the frame fresh
+          returns without charging -- so a burst of N viewers is one token, not
+          N, and cannot become an upstream request storm;
+        * a caller whose own bucket is exhausted is refused before any dial, so
+          the upstream is protected without the reader being penalised.
+
+        ``client_key`` is the per-caller identity (already hashed by
+        :func:`ratelimit.client_key`). When it is None the throttle is skipped --
+        a direct, in-process call that is not on behalf of a client.
         """
         entry = self._entry(camera_id)
         async with entry.lock:
             fresh = self.get_fresh(camera_id, source.ttl_s, now)
             if fresh is not None:
                 return fresh
+            _charge_fetch(camera_id, client_key)
             snap = await source.fetch()
             entry.snapshot = snap
             # Stamp with the caller's clock when one was injected, so a driven
@@ -587,13 +646,36 @@ def reset_cache() -> None:
     _CACHE.clear()
 
 
+def _charge_fetch(camera_id: str, client_key: str | None) -> None:
+    """Spend one upstream-fetch token for (camera, caller), or raise.
+
+    The bucket key pairs the camera with the caller so one caller hammering one
+    camera cannot starve another camera, and one camera's load does not spend a
+    different camera's budget. A caller with no identity (an in-process call) is
+    not throttled: there is no client to protect the upstream from there.
+    """
+    if client_key is None:
+        return
+    if not config.rate_limit_enabled():
+        # Honor the same switch the middleware does, so one `WX_RATE_LIMIT_DISABLED`
+        # disables throttling everywhere rather than leaving this path on.
+        return
+    allowed, retry = ratelimit.LIMITER.allow(
+        f"camsnap:{camera_id}:{client_key}", ratelimit.CAMERA_SNAPSHOT)
+    if not allowed:
+        raise FetchThrottled(retry)
+
+
 async def get_snapshot(camera_id: str, *, now: float | None = None,
-                       cache: SnapshotCache | None = None) -> Snapshot:
+                       cache: SnapshotCache | None = None,
+                       client_key: str | None = None) -> Snapshot:
     """The public entry point: a fresh frame for a camera id, or raise.
 
     Raises a :class:`SnapshotError` subclass; the caller (the endpoint) is
     responsible for collapsing it to a generic client response. ``cache`` is
-    injectable so a test can isolate state.
+    injectable so a test can isolate state. ``client_key`` (from
+    :func:`ratelimit.client_key`) is used only to charge the upstream-fetch
+    throttle on a miss; it is never stored or logged here.
     """
     cache = cache or _CACHE
     cam = cams.find_camera(camera_id)
@@ -607,7 +689,7 @@ async def get_snapshot(camera_id: str, *, now: float | None = None,
     fresh = cache.get_fresh(camera_id, source.ttl_s, now)
     if fresh is not None:
         return fresh
-    return await cache.get_or_fetch(camera_id, source, now)
+    return await cache.get_or_fetch(camera_id, source, now, client_key)
 
 
 # ------------------------------------------------------------------ health
@@ -637,6 +719,71 @@ def snapshot_via(camera_id: str) -> str | None:
     if mode is not None or has_source:
         return "server"
     return "direct"
+
+
+def cache_state(cache: SnapshotCache | None = None,
+                now: float | None = None) -> dict:
+    """Per-camera cache age and TTL, keyed by camera id. No frame bytes, no URL.
+
+    Operator-facing: tells an operator *which* camera is stale and how long its
+    TTL is, which the counts-only `health()` cannot. The id is public (it is in
+    the URL), and the entry's age/ttl are numbers; nothing here is a host, a
+    source URL or a credential, so it is safe to show behind an operator gate.
+    """
+    cache = cache or _CACHE
+    stamp = now if now is not None else time.time()
+    state: dict[str, dict] = {}
+    for camera_id, entry in cache._entries.items():
+        if entry.snapshot is None:
+            continue
+        state[camera_id] = {
+            "age_s": round(max(0.0, stamp - entry.fetched_at), 1),
+            "content_type": entry.snapshot.content_type,
+            "kind": entry.snapshot.source_kind,
+            "bytes": len(entry.snapshot.data),
+        }
+    return state
+
+
+def diagnostics(cache: SnapshotCache | None = None,
+                now: float | None = None) -> dict:
+    """Operator-facing per-camera snapshot state, sanitized.
+
+    Combines what the public payload knows (id, whether a still is configured,
+    the interval, how the browser will fetch it) with the cache's own view (age,
+    size). It deliberately reuses :func:`snapshot_via` for the transport decision
+    rather than re-deriving it, so an operator sees exactly what the browser is
+    told.
+
+    Never contains a source URL, a host, a credential or frame bytes. Served only
+    behind the operator gate (`GET /api/admin/cameras`).
+    """
+    cache = cache or _CACHE
+    stamp = now if now is not None else time.time()
+    cache_state_ = cache_state(cache, stamp)
+    out = []
+    for cam in cams.load_config():
+        cid = cam.get("id", "")
+        try:
+            source = source_for(cid)
+            src_kind = source.kind if source is not None else None
+            ttl = source.ttl_s if source is not None else None
+        except SnapshotError:
+            src_kind, ttl = "rejected", None
+        cached = cache_state_.get(cid)
+        out.append({
+            "id": cid,
+            "enabled": bool(cam.get("enabled", True)),
+            "configured": bool(cam.get("snapshot")),
+            "via": snapshot_via(cid),
+            "interval_min": cam.get("snapshot_interval_min"),
+            "source_kind": src_kind,
+            "ttl_s": ttl,
+            "cached": cached is not None,
+            "cache_age_s": cached["age_s"] if cached else None,
+            "cache_bytes": cached["bytes"] if cached else None,
+        })
+    return {"cameras": out}
 
 
 def health() -> dict:
