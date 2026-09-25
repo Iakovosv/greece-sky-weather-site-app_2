@@ -399,3 +399,48 @@ def test_health_stays_200_when_a_source_has_a_malformed_port(env):
     body = r.text
     assert SECRET_PASS not in body and "rtsp://" not in body and ":bad" not in body
 
+
+# ------------------- M2: the live player never shares the snapshot stage surface
+#
+# The YouTube embed is an official iframe; no custom control (LIVE badge, LIVE
+# button, close button) may sit over its surface. That is enforced structurally:
+# the player gets its own region, and while it is open the snapshot stage is
+# hidden outright, so the two surfaces are never visible at the same time.
+
+def test_the_payload_still_serves_a_live_block(env):
+    """Guard for the M2 test below: a configured camera still publishes live."""
+    env(cameras=json.dumps([_public_cam(live_enabled=True, live_provider="youtube",
+                                        youtube_live_id="AbCdEf12345")]))
+    cam = cams.camera_payload()["cameras"][0]
+    assert cam["live"]["provider"] == "youtube"
+    assert cam["live"]["video_id"] == "AbCdEf12345"
+
+
+def test_m2_player_region_is_separate_from_the_snapshot_stage(env):
+    """The card renders a player region and a control bar distinct from the
+    stage. This pins the M2 fix: the player no longer lives inside `.stage`, so
+    nothing positioned in the stage can overlay it."""
+    env(cameras=json.dumps([_public_cam(live_enabled=True, live_provider="youtube",
+                                        youtube_live_id="AbCdEf12345")]))
+    import app as app_module
+    html = TestClient(app_module.app).get("/").text
+    assert 'id="camplayer-' in html
+    assert 'id="camctl-' in html
+    # The iframe is built into the player region, not the stage.
+    assert "showLiveFallback(player" in html
+    # And the old coupling -- the iframe appended into the stage -- is gone.
+    assert "showLiveFallback(stage" not in html
+    assert "stage.appendChild(f)" not in html
+
+
+def test_m2_stage_is_hidden_while_the_player_is_open(env):
+    """The CSS hides the whole stage in playing mode (not just the image), so the
+    stage's overlays cannot remain visible over the iframe."""
+    env(cameras=json.dumps([_public_cam(live_enabled=True, live_provider="youtube",
+                                        youtube_live_id="AbCdEf12345")]))
+    import app as app_module
+    html = TestClient(app_module.app).get("/").text
+    assert ".cam .stage.playing{display:none}" in html
+    # The iframe is positioned inside the player region, not the stage.
+    assert ".cam .camplayer .camframe{position:absolute" in html
+    assert ".cam .stage .camframe" not in html

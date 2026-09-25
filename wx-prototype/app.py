@@ -903,12 +903,19 @@ td.ph{background:linear-gradient(90deg,rgba(255,255,255,.08),rgba(255,255,255,.1
   border:1px solid rgba(255,255,255,.18);font-size:11.5px;font-weight:700;letter-spacing:.04em;
   padding:6px 12px;border-radius:20px;cursor:pointer;backdrop-filter:blur(4px)}
 .cam .stage .golive:hover{background:rgba(255,59,48,.85)}
-.cam .stage.playing img{visibility:hidden}
-.cam .stage .camframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}
-.cam .stage .closecam{position:absolute;top:9px;right:9px;z-index:2;background:rgba(17,17,17,.78);
+.cam .stage.playing{display:none}
+/* When a live player is open its own region takes the stage's place in the flex
+   column and the stage (snapshot + its overlay badges/button) is hidden
+   entirely, so no custom control can sit over the YouTube player. The iframe is
+   plain in-flow content -- official YouTube embed, untouched. */
+.cam .camplayer{display:none;position:relative;aspect-ratio:16/9;background:#000;overflow:hidden}
+.cam .camplayer.playing{display:block}
+.cam .camplayer .camframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block;background:#000}
+.cam .camctl{display:flex;justify-content:flex-end;padding:8px 12px 0}
+.cam .camctl .closecam{background:rgba(17,17,17,.78);
   color:#fff;border:1px solid rgba(255,255,255,.18);font-size:11.5px;padding:5px 11px;
   border-radius:18px;cursor:pointer;font-family:inherit}
-.cam .stage .livefb{position:absolute;inset:auto 12px 12px 12px;z-index:2;background:rgba(17,17,17,.85);
+.cam .camplayer .livefb{position:absolute;inset:auto 12px 12px 12px;z-index:2;background:rgba(17,17,17,.85);
   color:var(--dim);font-size:12px;padding:9px 11px;border-radius:8px;text-align:center}
 .camhead{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .toggle{display:inline-flex;align-items:center;gap:9px;font-size:13px;cursor:pointer;
@@ -2995,6 +3002,8 @@ function renderCameras(){
       : '';
     return '<div class="cam" id="camcard-'+esc(c.id)+'">'
       +'<div class="stage" id="camstage-'+esc(c.id)+'">'+stage+badge+golive+'</div>'
+      +'<div class="camplayer" id="camplayer-'+esc(c.id)+'"></div>'
+      +'<div class="camctl" id="camctl-'+esc(c.id)+'" hidden></div>'
       +'<div class="meta"><div class="nm">'+esc(c.name)+'</div>'
       +'<div class="rg">'+esc(c.region||'')+(c.lat!=null?' · '+c.lat.toFixed(2)+', '+c.lon.toFixed(2):'')+'</div>'
       +cadence
@@ -3007,7 +3016,10 @@ function pluralMin(n){ return n===1? 'λεπτό':'λεπτά'; }
    provider is YouTube, embedded through the official player with the public
    video id the server publishes. The camera's own address never reaches the
    browser, so there is no RTSP URL to leak. Opening is a user action (so autoplay
-   is allowed), and closing restores the last snapshot the card already holds. */
+   is allowed), and closing restores the last snapshot the card already holds.
+   The player occupies its own region (#camplayer-*), never the snapshot stage:
+   the snapshot stage is hidden while live is open, so no custom control (badge,
+   LIVE button, close button) can ever overlay the iframe. */
 function youtubeEmbedUrl(videoId){
   // Privacy-enhanced mode, per YouTube's documentation. `mute=1` is a default,
   // not the audio guarantee: audio is kept out of the stream pipeline itself.
@@ -3020,9 +3032,15 @@ function openCamLive(id){
   const c=CAMS.cameras.find(x=>x.id===id);
   if(!c||!c.live) return;
   const stage=document.getElementById('camstage-'+id);
-  if(!stage) return;
+  const player=document.getElementById('camplayer-'+id);
+  const bar=document.getElementById('camctl-'+id);
+  if(!stage||!player||!bar) return;
   track('sky_camera_live_opened');
+  // Hide the snapshot stage (with its overlays) and give the player its own
+  // region. The two are never visible at once, so nothing can sit over the embed.
   stage.classList.add('playing');
+  player.classList.add('playing');
+  player.innerHTML='';
   if(c.live.provider==='youtube'){
     const f=document.createElement('iframe');
     f.className='camframe';
@@ -3030,23 +3048,27 @@ function openCamLive(id){
     f.setAttribute('allow','autoplay; encrypted-media; picture-in-picture; fullscreen');
     f.setAttribute('allowfullscreen','');
     f.src=youtubeEmbedUrl(c.live.video_id);
-    f.onerror=()=>{ showLiveFallback(stage,'Ο player δεν φόρτωσε. Δοκίμασε ξανά.'); };
-    stage.appendChild(f);
+    f.onerror=()=>{ showLiveFallback(player,'Ο player δεν φόρτωσε. Δοκίμασε ξανά.'); };
+    player.appendChild(f);
     // Autoplay can be refused; the official player then shows its own play
     // control, which is the correct fallback. Never assume it started.
   } else {
-    showLiveFallback(stage,'Ο πάροχος ζωντανής ροής δεν υποστηρίζεται.');
+    showLiveFallback(player,'Ο πάροχος ζωντανής ροής δεν υποστηρίζεται.');
   }
+  // The close control lives in flow, in its own bar below the player -- outside
+  // the iframe's surface, never over the official YouTube controls.
   const close=document.createElement('button');
   close.className='closecam'; close.textContent='Κλείσιμο LIVE';
   close.onclick=()=>closeCamLive(id);
-  stage.appendChild(close);
+  bar.innerHTML=''; bar.appendChild(close); bar.hidden=false;
 }
 function closeCamLive(id){
   const stage=document.getElementById('camstage-'+id);
-  if(!stage) return;
-  stage.classList.remove('playing');
-  stage.querySelectorAll('.camframe,.closecam,.livefb').forEach(n=>n.remove());
+  const player=document.getElementById('camplayer-'+id);
+  const bar=document.getElementById('camctl-'+id);
+  if(stage) stage.classList.remove('playing');
+  if(player){ player.classList.remove('playing'); player.innerHTML=''; }
+  if(bar){ bar.hidden=true; bar.innerHTML=''; }
   const c=CAMS&&CAMS.cameras.find(x=>x.id===id);
   const img=document.getElementById('camimg-'+id);
   if(c&&img){ // refresh to the newest frame rather than the stale one
@@ -3055,10 +3077,10 @@ function closeCamLive(id){
     img.src=c.snapshot+sep+'t='+CAMS.stamp;
   }
 }
-function showLiveFallback(stage,msg){
+function showLiveFallback(player,msg){
   const d=document.createElement('div');
   d.className='livefb'; d.textContent=msg;
-  stage.appendChild(d);
+  player.appendChild(d);
 }
 function gotoPoint(lat,lon,name){
   // Straight to the forecast for the camera's own coordinates, rather than
