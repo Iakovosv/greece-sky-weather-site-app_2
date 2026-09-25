@@ -72,6 +72,13 @@ NOTIFY_WRITE = Limits(rate=0.25, burst=6)
 # The test push actually hits Google/Apple/Mozilla and costs quota, so it is the
 # tightest limit in the app: a handful per day for a person, not a loop.
 NOTIFY_TEST = Limits(rate=1.0 / 120.0, burst=2)
+# Camera stream control (admin/internal only for now). Starting a worker is the
+# most expensive action in the app -- it may spawn a media process -- so it is
+# deliberately the tightest of the camera buckets: a few operations, then a pause
+# long enough that a scripted loop cannot churn workers. It is a *separate* bucket
+# from CAMERA_SNAPSHOT so an operator reading snapshots is never limited by, and
+# never limits, a stream control action.
+CAMERA_LIVE_CONTROL = Limits(rate=0.1, burst=3)
 # Everything else, including the free astronomy card.
 DEFAULT = Limits(rate=2.0, burst=60)
 

@@ -452,7 +452,13 @@ def _validate_source(raw: dict) -> dict | None:
     }
 
 
-def _load_sources() -> dict[str, dict]:
+def _parse_sources_raw() -> dict[str, dict]:
+    """The declared private sources by id, **before** any validation.
+
+    Split out so the lifecycle view can explain *why* a source was refused
+    without re-deriving it: the declared entry and the validated entry are the
+    same input seen at two stages. Never merged into a payload.
+    """
     raw = os.environ.get("WX_CAMERA_SOURCES")
     if not raw:
         return {}
@@ -466,12 +472,46 @@ def _load_sources() -> dict[str, dict]:
                   for k, v in parsed.items()]
     if not isinstance(parsed, list):
         return {}
+    return {str(i["id"]): i for i in parsed
+            if isinstance(i, dict) and i.get("id")}
+
+
+def _load_sources() -> dict[str, dict]:
     out: dict[str, dict] = {}
-    for item in parsed:
+    for item in _parse_sources_raw().values():
         clean = _validate_source(item)
         if clean and clean["id"]:
             out[clean["id"]] = clean
     return out
+
+
+def declared_source(camera_id: str) -> dict | None:
+    """The raw, unvalidated private source declared for an id, or None.
+
+    Server-side only, and only so an operator-facing lifecycle view can name the
+    failing rule instead of reporting a source as simply "absent". The returned
+    dict is never embedded in a response or a log line.
+    """
+    return declared_sources().get(str(camera_id or "").strip() or "\x00")
+
+
+def declared_sources() -> dict[str, dict]:
+    """Every declared private source by id, before validation.
+
+    A batch form of :func:`declared_source` for callers that need them all (the
+    lifecycle summary); returns the same entries without re-parsing per id.
+    Server-side only, never merged into a payload.
+    """
+    return _parse_sources_raw()
+
+
+def all_sources() -> dict[str, dict]:
+    """Every validated private source by id.
+
+    Batch form of :func:`source_for`. Server-side only: the dict holds URLs and
+    credential references, so it must never reach a payload or a log.
+    """
+    return _load_sources()
 
 
 def source_for(camera_id: str) -> dict | None:

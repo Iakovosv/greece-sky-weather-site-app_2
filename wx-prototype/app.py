@@ -45,6 +45,7 @@ import analytics  # noqa: E402 - must follow envfile.load() above
 import astro  # noqa: E402
 import bias  # noqa: E402
 import billing as bill  # noqa: E402
+import camera_lifecycle as lifecycle  # noqa: E402
 import cameras as cams  # noqa: E402
 import config  # noqa: E402
 import entitlements as ent  # noqa: E402
@@ -56,6 +57,7 @@ import promo  # noqa: E402
 import ratelimit  # noqa: E402
 import scheduler  # noqa: E402
 import snapshots  # noqa: E402
+import stream_control as streams  # noqa: E402
 import verify as vfy  # noqa: E402
 import wx  # noqa: E402
 
@@ -245,6 +247,15 @@ async def _report_optional_deps():
         promo.init_db()
     except Exception as e:
         log.error("promo database unavailable: %s", e)
+    try:
+        streams.init_db()
+    except Exception as e:
+        log.error("stream state database unavailable: %s", e)
+    if config.stream_enabled():
+        log.info("Stream control plane ενεργό (WX_STREAM_ENABLED), backend=%s, "
+                 "max_active=%d.", config.stream_backend(), config.stream_max_active())
+        global _stream_task
+        _stream_task = asyncio.create_task(_stream_reconcile_loop())
     if not astro._HAVE_EPHEM:
         err = astro.import_error()
         if err and astro.is_missing():
@@ -364,12 +375,33 @@ async def _notify_series(lat: float, lon: float) -> list[dict] | None:
     return _normalize_hours(rows)
 
 
+_stream_task: asyncio.Task | None = None
+
+
+async def _stream_reconcile_loop(interval_s: int = 30) -> None:
+    """Mark wedged workers as errored, so a dead worker cannot stay 'live'.
+
+    Reconciliation only ever *narrows* state (starting/stopping -> error); it
+    never starts anything. The M3 worker will also call
+    ``stream_control.reconcile`` on its own boot, but the web process runs it too
+    so the public status is correct even before the worker is deployed.
+    """
+    while True:
+        try:
+            streams.reconcile()
+        except Exception as e:  # never let the loop die
+            log.warning("stream reconcile pass crashed: %s", type(e).__name__)
+        await asyncio.sleep(interval_s)
+
+
 @app.on_event("shutdown")
 async def _stop_ram_scheduler():
     if _notify_task is not None and not _notify_task.done():
         _notify_task.cancel()
     if _ram_task is not None and not _ram_task.done():
         _ram_task.cancel()
+    if _stream_task is not None and not _stream_task.done():
+        _stream_task.cancel()
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -4165,6 +4197,15 @@ async def health():
         # Snapshot runtime: counts of resolved sources by kind, and how many are
         # still the offline mock. Never a URL, host or credential.
         "snapshots": snapshots.health(),
+        # Camera lifecycle: counts per readiness state, no identifiers. Shows an
+        # operator how many cameras are actually activated without naming any.
+        "camera_lifecycle": lifecycle.summary(),
+        # Stream control plane: whether it is on, which backend, the cap and how
+        # many streams are running. Counts and names only -- no ids, no commands.
+        "streams": {"enabled": config.stream_enabled(),
+                    "backend": config.stream_backend(),
+                    "max_active": config.stream_max_active(),
+                    "active": streams.active_count() if config.stream_enabled() else 0},
         "data_sources": ["GFS (public domain)", "ICON-EU DWD (CC BY 4.0)",
                          "ECMWF open data (CC BY 4.0, best-effort)",
                          "Photon geocoding (OSM)", "OpenTopoData DEM"],
@@ -4834,11 +4875,27 @@ async def cameras_endpoint():
     ("server", for a private source the browser must never see).
     """
     payload = cams.camera_payload()
+    # One read for the whole list instead of a lookup per camera. With the control
+    # plane off there can be no live worker, so the answer is a constant and no
+    # read happens at all; the key is emitted either way, so the payload shape
+    # does not depend on a feature flag.
+    running = streams.running_map() if config.stream_enabled() else {}
     for cam in payload.get("cameras", []):
         via = snapshots.snapshot_via(cam.get("id", ""))
         if via:
             cam["snapshot_via"] = via
+        # Additive coarse status for the future LIVE affordance. `running` is the
+        # *observed*, still-fresh worker truth only -- false while the control
+        # plane is off, so today's payload grows one always-false boolean and
+        # nothing else. No PID, command, host, error text or RTSP state is here;
+        # those stay admin-only.
+        cam["live_status"] = _live_status(running.get(cam.get("id", ""), False))
     return payload
+
+
+def _live_status(running: bool) -> dict:
+    """The one public live field. Kept identical for list and detail endpoints."""
+    return {"running": bool(running)}
 
 
 @app.get("/api/cameras/{camera_id}")
@@ -4848,10 +4905,16 @@ async def camera_endpoint(camera_id: str):
     The id is looked up in server-side configuration and never used to build a
     URL, so an arbitrary id cannot reach any feed or private source. A camera
     that an operator disabled is indistinguishable from one that never existed.
+
+    Carries the same additive ``live_status`` as the list endpoint, from the same
+    source of truth, so the two never disagree about whether a camera is running.
     """
     cam = cams.find_camera(camera_id)
     if cam is None:
         raise HTTPException(404, "Η κάμερα δεν υπάρχει.")
+    running = (streams.public_running(camera_id)
+               if config.stream_enabled() else False)
+    cam = {**cam, "live_status": _live_status(running)}
     return cam
 
 
@@ -5520,7 +5583,95 @@ async def admin_cameras(request: Request):
     answer "which camera is stale, and how will the browser fetch it".
     """
     require_admin(request)
-    return snapshots.diagnostics()
+    diag = snapshots.diagnostics()
+    for row in diag.get("cameras", []):
+        life = lifecycle.lifecycle_of(row.get("id", ""))
+        if life:
+            row["lifecycle"] = {"state": life["state"], "reason": life["reason"],
+                                "checks": life["checks"]}
+    return diag
+
+
+@app.get("/api/admin/streams")
+async def admin_streams(request: Request):
+    """Observed/desired stream state for every camera, sanitized.
+
+    Admin-only, like the rest of the control surface. The payload is state names,
+    counts, ISO timestamps and a closed-vocabulary error reason: no command line,
+    PID, host, RTSP URL, credential or worker message can appear here.
+    """
+    require_admin(request)
+    return {
+        "enabled": config.stream_enabled(),
+        "backend": config.stream_backend(),
+        "max_active": config.stream_max_active(),
+        "active": streams.active_count(),
+        "streams": streams.all_status(),
+    }
+
+
+def _stream_control_key(request: Request) -> str:
+    """Per-caller key for the stream-control bucket.
+
+    Namespaced separately from the snapshot bucket so the two never share tokens.
+    """
+    return "livectl:" + ratelimit.client_key(request, config.trust_proxy_headers())
+
+
+def _control_throttled(request: Request):
+    """None when allowed; a 429 response when this caller must wait.
+
+    A dedicated bucket (`CAMERA_LIVE_CONTROL`), not the generic limiter, because
+    starting a worker is far more expensive than an ordinary request and the
+    existing per-path limits were not designed for it.
+    """
+    if not config.rate_limit_enabled():
+        return None
+    allowed, retry = ratelimit.LIMITER.allow(_stream_control_key(request),
+                                             ratelimit.CAMERA_LIVE_CONTROL)
+    if allowed:
+        return None
+    wait = max(1, int(retry + 0.999))
+    log.warning("stream control throttled: path=%s retry_after=%ds",
+                request.url.path, wait)
+    return JSONResponse(
+        {"detail": "Πολλά αιτήματα σε σύντομο χρόνο. Δοκίμασε ξανά σε λίγο.",
+         "retry_after": wait},
+        status_code=429, headers={"Retry-After": str(wait)})
+
+
+@app.post("/api/admin/streams/{camera_id}/start")
+async def admin_stream_start(camera_id: str, request: Request):
+    """Ask the control plane to run one camera's stream. Admin-only, idempotent.
+
+    This is the M2 *testing/operations* surface, deliberately not a public
+    endpoint: the browser must never be able to start a worker directly. A future
+    public LIVE request will go through a server-side policy step and call the
+    same ``stream_control.request_start`` -- the control plane is unchanged by
+    that; only a new caller is added.
+    """
+    require_admin(request)
+    throttled = _control_throttled(request)
+    if throttled is not None:
+        return throttled
+    if not config.stream_enabled():
+        raise HTTPException(503, "Ο έλεγχος ροών δεν είναι ενεργός.")
+    result = await streams.request_start(camera_id)
+    if not result["ok"] and result["reason"] in ("unknown_camera", "not_ready"):
+        raise HTTPException(409, "Η κάμερα δεν είναι έτοιμη για ροή.")
+    return result
+
+
+@app.post("/api/admin/streams/{camera_id}/stop")
+async def admin_stream_stop(camera_id: str, request: Request):
+    """Ask the control plane to stop one camera's stream. Admin-only, idempotent."""
+    require_admin(request)
+    throttled = _control_throttled(request)
+    if throttled is not None:
+        return throttled
+    if not config.stream_enabled():
+        raise HTTPException(503, "Ο έλεγχος ροών δεν είναι ενεργός.")
+    return await streams.request_stop(camera_id)
 
 
 # ---------------------------------------------------------------- notifications (PRO)

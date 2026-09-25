@@ -162,6 +162,49 @@ WX_CAMERA_ALLOWED_HOSTS=CAMERA_LAN_HOST
 Endpoints: `GET /api/cameras` (λίστα) και `GET /api/cameras/{id}` (detail) —
 δημόσια, ίδια βάση με πριν, χωρίς URL parameter. Άγνωστο ή disabled id → 404.
 
+### Lifecycle κάμερας (M1) — admin-only
+
+Κάθε κάμερα έχει μια **παράγωγη** (όχι αποθηκευμένη) κατάσταση ετοιμότητας:
+
+```
+disabled  ->  configured  ->  tested  ->  enabled
+```
+
+* `disabled` — `enabled: false`. Η κάμερα είναι σβηστή.
+* `configured` — δηλωμένη, αλλά χωρίς πλήρη ιδιωτική πηγή ή με αποτυχημένο check.
+* `tested` — υπάρχει πηγή και πέρασαν όλα τα server-side checks (scheme, host
+  allowlist, credential resolution, video-only).
+* `enabled` — `tested` **και** live ενεργό με έγκυρο δημόσιο id. Αυτό είναι το
+  gate που θα απαιτήσει ο M3 worker πριν ξεκινήσει.
+
+Εμφανίζεται **μόνο** στο `GET /api/admin/cameras` (κάτω από `X-WX-Admin`). Το
+δημόσιο `status` παραμένει ως έχει. Ένα αποτυχημένο check δίνει sanitized reason
+από κλειστό λεξιλόγιο (`source_absent`, `host_not_allowlisted`, `credential_missing`,
+…) — ποτέ URL, host ή credential.
+
+### Stream control plane (M2) — admin-only
+
+Ο server-side layer που *αποφασίζει* για ροή, χωρίς να τρέχει ροή:
+
+* **desired** (`stopped`/`running`) = control plane, **observed**
+  (`stopped`/`starting`/`live`/`stopping`/`error`) = worker.
+* Το δημόσιο `live_status.running` προκύπτει **μόνο** από observed `live` —
+  ένα "start requested" δεν είναι ροή. Stale `starting` λήγει σε `error`.
+* State στο υπάρχον `WX_DB` (table `stream_state`, WAL) ώστε ο μελλοντικός
+  ξεχωριστός worker του M3 να βλέπει τα ίδια rows.
+* Idempotent start/stop, per-camera prevention, hard cap `WX_STREAM_MAX_ACTIVE`
+  (default/floor 1), dedicated rate-limit bucket `CAMERA_LIVE_CONTROL`.
+* `MockStreamWorker` (κανένα δίκτυο, κανένα secret) — ο M3 αλλάζει μόνο backend.
+
+Endpoints (admin-only, όχι public start/stop ακόμη):
+
+* `GET  /api/admin/streams` — state ανά κάμερα (sanitized).
+* `POST /api/admin/streams/{id}/start` — idempotent start.
+* `POST /api/admin/streams/{id}/stop`  — idempotent stop.
+
+**Δεν** υπάρχει ακόμη FFmpeg, RTSP dial, YouTube publishing, stream key ή VPS
+αλλαγή. Ο browser δεν έχει — και δεν θα αποκτήσει εδώ — άμεσο control endpoint.
+
 ## Βαθμίδες
 
 Το κλείδωμα εφαρμόζεται **στον server**, όχι με CSS. Στο FREE το `/api/brief`

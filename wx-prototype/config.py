@@ -211,6 +211,38 @@ def rate_limit_enabled() -> bool:
     return _env("WX_RATE_LIMIT_DISABLED").lower() not in ("1", "true", "yes", "on")
 
 
+# ---------------------------------------------------------------- camera streams
+
+def stream_enabled() -> bool:
+    """Whether the stream control plane may act at all. Off unless opted in.
+
+    Default off: the control plane ships with M2, but no deploy should start
+    asking a worker to run until the operator has decided to. With it off,
+    ``request_start`` refuses and ``live_status`` stays ``running: false``.
+    """
+    return _env("WX_STREAM_ENABLED").lower() in ("1", "true", "yes", "on")
+
+
+def stream_max_active() -> int:
+    """Hard ceiling on concurrently running camera streams.
+
+    Default and safe floor of 1: one camera streaming is the first production
+    posture. A value below 1, or a non-numeric one, is clamped up to 1 rather
+    than allowing "no limit" or an accidental 0 that would read as unlimited.
+    """
+    raw = _env("WX_STREAM_MAX_ACTIVE")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, n)
+
+
+def stream_backend() -> str:
+    """Which worker backend to use. M2 ships only ``mock``; M3 adds the real one."""
+    return _env("WX_STREAM_BACKEND") or "mock"
+
+
 # These are read once, at import. That is correct for `ENV` because
 # `envfile.load()` runs before this module is imported (app.py imports it first),
 # and because a "which environment am I" decision must not change mid-process.
