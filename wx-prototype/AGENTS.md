@@ -16,6 +16,7 @@ adding infrastructure is an explicit non-goal.
 |---|---|
 | `app.py` | FastAPI app, the UI string, all HTTP routes, forecast assembly |
 | `wx.py` | GRIB download/parse (GFS, ICON-EU, ECMWF), geocoding, DEM, cache |
+| `ensemble.py` | GEFS 31-member mean/spread; the ensemble agreement figure |
 | `entitlements.py` | Tier limits, token signing/verification, pricing metadata |
 | `cachestore.py` | Result/file cache: size cap, eviction, corruption tolerance |
 | `billing.py` | Stripe checkout, webhook lifecycle, subscription state, auto-renew |

@@ -15,6 +15,7 @@
 | Πηγή | Τι παρέχει | Άδεια | Εμπορική | Αναδιανομή | Υποχρεώσεις |
 |---|---|---|---|---|---|
 | **NOAA/NWS GFS** (NOMADS, AWS) | Παγκόσμιο 0.25°, GRIB2 | US Public Domain (17 USC §105) | ✅ | ✅ | Καμία νομική· ζητείται αναφορά. Απαγορεύεται να δηλώσεις σχέση/έγκριση NOAA |
+| **NOAA/NWS GEFS** (NOMADS grib filter + NODD) | 0.5°, `geavg` μέσος όρος + `gespr` διασπορά (από 30 διαταραγμένα μέλη) | US Public Domain (17 USC §105) | ✅ | ✅ | Ίδιο καθεστώς με GFS (NWS disclaimer: «may be used without charge for any lawful purpose»). Απαγορεύεται η υποδήλωση σχέσης/έγκρισης NOAA και η παρουσίαση τροποποιημένου υλικού ως επίσημου. Χρήση: δείκτης διασποράς ensemble. Αναφορά NOAA στο UI |
 | **ECMWF Open Data** (IFS) | 0.25°, GRIB2 | **CC BY 4.0** | ✅ ρητά | ✅ | Αναφορά + σύνδεσμος + ένδειξη αλλαγών + disclaimer |
 | **DWD ICON / ICON-EU** | 7 km Ευρώπη | **CC BY 4.0** (GeoNutzV) | ✅ ρητά | ✅ | «Source: Deutscher Wetterdienst» δίπλα στα δεδομένα |
 | **Copernicus ERA5 / EU-DEM** | Reanalysis· DEM 25 m | CC BY 4.0 / Copernicus | ✅ | ✅ | «Generated using Copernicus … information [έτος]» |

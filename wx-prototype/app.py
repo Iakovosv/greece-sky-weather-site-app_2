@@ -48,6 +48,7 @@ import billing as bill  # noqa: E402
 import camera_lifecycle as lifecycle  # noqa: E402
 import cameras as cams  # noqa: E402
 import config  # noqa: E402
+import ensemble  # noqa: E402
 import entitlements as ent  # noqa: E402
 import grids  # noqa: E402
 import legal  # noqa: E402
@@ -2777,7 +2778,12 @@ function expertBody(d){
       +'<p><span class="badge '+(e.agreement.available?e.agreement.class:'')+'">'
       +e.agreement.text+'</span> '+(e.agreement.detail||'')+'</p>'
       +'<p class="note">Εκτίμηση από τη σύγκλιση μοντέλων, όχι από ιστορικό σφάλμα. Αν όλα τα '
-      +'μοντέλα κάνουν το ίδιο λάθος, η τιμή θα φαίνεται υψηλή.</p></div>';
+      +'μοντέλα κάνουν το ίδιο λάθος, η τιμή θα φαίνεται υψηλή.</p>'
+      +(e.ensemble
+        ? '<p class="note"><b>Διασπορά GEFS ('+e.ensemble.members+' μελών): '
+          +esc(e.ensemble.text)+'</b> — '+esc(e.ensemble.detail)+'</p>'
+        : '')
+      +'</div>';
   }
 
   if(e.model_grid){
@@ -4530,9 +4536,23 @@ async def _build_brief(request: Request, lat: float, lon: float, station: str | 
                     continue
             return {}
 
-        gfs_rows, prof, icon, ec, orog = await asyncio.gather(
+        async def ensemble_task():
+            # GEFS mean/spread: a genuinely 31-member spread behind the agreement
+            # figure, which otherwise rests on three deterministic runs. Best
+            # effort by design - if NOMADS is slow the 3-model spread stands in,
+            # and it is never allowed to fail the forecast. Skipped entirely for a
+            # FREE caller: the expert block that consumes it is PRO-only, so the
+            # extra NOMADS load would be spent on nobody.
+            if not entl.is_pro:
+                return {}
+            try:
+                return await ensemble.gefs_ensemble_point(c, lat, lon, step=24)
+            except Exception:
+                return {}
+
+        gfs_rows, prof, icon, ec, orog, ens = await asyncio.gather(
             rows_task, prof_task, icon_task(), ecmwf_task(), orog_task,
-            return_exceptions=True)
+            ensemble_task(), return_exceptions=True)
 
     if isinstance(gfs_rows, Exception) or not gfs_rows:
         return JSONResponse({"error": f"GFS unavailable: {gfs_rows}"}, status_code=502)
@@ -4615,6 +4635,16 @@ async def _build_brief(request: Request, lat: float, lon: float, station: str | 
                          "msl_hpa": round(ec["msl"] / 100, 1) if ec.get("msl") else None})
         expert["model_grid"] = grid
         expert["agreement"] = agreement(temperature_series_for_agreement(gfs_rows, icon, ec))
+        # The GEFS ensemble, when it is available, adds a distribution-aware
+        # number alongside the 3-model spread: 30 perturbed members against 3
+        # deterministic runs. It is additive - the 3-model figure stays, so the
+        # card degrades to today's behaviour if NOMADS does not answer. It is
+        # reported as a spread, never as "confidence"; see ensemble.describe().
+        ens_ok = isinstance(ens, dict) and ens.get("t2m_spread_c") is not None
+        if ens_ok:
+            expert["ensemble"] = ensemble.describe(
+                ens["t2m_spread_c"], members=ens.get("members", ensemble.GEFS_PERTURBED_MEMBERS),
+                mean_c=ens.get("t2m_mean_c"), hours=ens.get("step")) | {"run": ens.get("run")}
         if isinstance(gfs_rows[0], dict):
             expert["gfs_now"] = {k: (round(v, 2) if isinstance(v, float) else v)
                                  for k, v in gfs_rows[0].items()}

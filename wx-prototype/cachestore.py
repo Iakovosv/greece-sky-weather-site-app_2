@@ -123,6 +123,35 @@ def get(key: str, ttl: int) -> bytes | None:
         return None
 
 
+def get_stale(key: str, max_age: int) -> bytes | None:
+    """Cached bytes that are past the TTL but younger than `max_age`, or None.
+
+    A deliberate escape hatch for the case where the fresh fetch has *already*
+    failed: an old but real field is better than an empty card during a model run
+    rollout or a brief upstream outage. It shares `get`'s corruption tolerance, so
+    a truncated entry is still discarded rather than decoded.
+    """
+    p = _path(key)
+    try:
+        age = time.time() - os.path.getmtime(p)
+        size = os.path.getsize(p)
+    except OSError:
+        return None
+    if age >= max_age:
+        return None
+    if size < MIN_REAL_BYTES:
+        log.warning("stale cache entry too small (%d B), discarding: key=%s", size, key)
+        _unlink(p)
+        return None
+    try:
+        with open(p, "rb") as f:
+            return f.read()
+    except OSError as e:
+        log.warning("stale cache read failed (%s), discarding: key=%s", e, key)
+        _unlink(p)
+        return None
+
+
 def put(key: str, blob: bytes) -> None:
     """Write atomically, then enforce the size cap.
 
