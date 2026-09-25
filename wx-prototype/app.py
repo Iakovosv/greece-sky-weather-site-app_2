@@ -1244,6 +1244,20 @@ function esc(s){
   return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',
     '"':'&quot;',"'":'&#39;'}[c]));
 }
+/* For a value placed inside an inline handler *argument*, which is a JavaScript
+   string literal, not HTML text. `esc()` alone is the wrong tool there: the
+   browser decodes `&#39;` back to `'` before the JS parser runs, so an
+   apostrophe would end the literal and break — or inject into — the handler.
+   Escape for the JS literal first (backslash, quote, control characters, and
+   `<` so no `</script>` can form), then let `esc()` handle the attribute
+   quoting. Always use as `esc(jsq(value))` inside an inline handler. */
+function jsq(s){
+  return String(s==null?'':s)
+    .replace(/\\/g,'\\\\')
+    .replace(/'/g,"\\'")
+    .replace(/\r/g,'\\r').replace(/\n/g,'\\n')
+    .replace(/</g,'\\x3c');
+}
 
 const FREE_HOURS=72, PRO_HOURS=240;
 
@@ -2978,7 +2992,7 @@ document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
    Cameras are the only thing here that is not reproducible from open data, so
    they get shown as-is. When a feed is not wired up yet the card says so plainly
    instead of showing a broken image. */
-let CAMS=null, LIVE_ON=false, CAM_TIMER=null;
+let CAMS=null, LIVE_ON=false, CAM_TIMER=null, CAM_LAST={};
 
 async function loadCameras(){
   const box=document.getElementById('cams');
@@ -3015,15 +3029,15 @@ function renderCameras(){
       stage='<span class="camload">Φόρτωση εικόνας…</span>'
         +'<img id="camimg-'+esc(c.id)+'" src="'+esc(camSnapshotSrc(c, CAMS.stamp))+'"'
         +' alt="'+esc(c.name)+' — ζωντανή εικόνα" loading="lazy"'
-        +' onload="snapshotLoaded(\''+esc(c.id)+'\')"'
-        +' onerror="snapshotFailed(\''+esc(c.id)+'\')">';
+        +' onload="snapshotLoaded(\''+esc(jsq(c.id))+'\')"'
+        +' onerror="snapshotFailed(\''+esc(jsq(c.id))+'\')">';
       badge='<div class="live" id="cambadge-'+esc(c.id)+'" hidden><i></i>LIVE</div>';
     }else{
       stage='<div class="off">Η εικόνα δεν είναι διαθέσιμη<br><b>'+esc(c.name)+'</b></div>';
       badge='<div class="live off"><i></i>OFFLINE</div>';
     }
     const golive = (live && c.live)
-      ? '<button class="golive" onclick="openCamLive(\''+esc(c.id)+'\')"'
+      ? '<button class="golive" onclick="openCamLive(\''+esc(jsq(c.id))+'\')"'
         +' aria-label="Άνοιγμα ζωντανής ροής: '+esc(c.name)+'">🔴 LIVE</button>'
       : '';
     const tl = c.timelapse
@@ -3033,7 +3047,7 @@ function renderCameras(){
     // report *why* it is missing, which would expose server configuration.
     const note = live? '' :
       '<div class="notebox">Η εικόνα αυτής της κάμερας δεν είναι ακόμη διαθέσιμη.</div>';
-    const mapq=c.lat!=null&&c.lon!=null? ' onclick="gotoPoint('+c.lat+','+c.lon+',\''+esc(c.name)+'\')"' : '';
+    const mapq=c.lat!=null&&c.lon!=null? ' onclick="gotoPoint('+c.lat+','+c.lon+',\''+esc(jsq(c.name))+'\')"' : '';
     const cadence = live
       ? '<div class="cad">Αυτόματη εικόνα: κάθε '+c.snapshot_interval_min+' '+pluralMin(c.snapshot_interval_min)+'</div>'
       : '';
@@ -3207,14 +3221,35 @@ function gotoPoint(lat,lon,name){
   window.scrollTo({top:0,behavior:'smooth'});
 }
 /* Refresh only the pixels, never the whole card: re-rendering on every tick would
-   drop focus and make the grid flicker. */
+   drop focus and make the grid flicker.
+
+   The polling window is `snapshot_interval_min` — the same number the card shows
+   the visitor — so the still is re-fetched no more often than the feed it claims
+   to come from. It drives a single fast ticker and gates each camera on its own
+   cadence, because a per-camera interval would multiply `CAM_TIMER` by the number
+   of configured feeds. `refresh_seconds` is therefore the *tick granularity*,
+   never a competing cadence: the tick never exceeds a camera's own interval. */
+function refreshTickMs(){
+  const tick=(CAMS&&CAMS.refresh_seconds||60)*1000;
+  const cams=(CAMS&&CAMS.cameras)||[];
+  let smallest=null;
+  for(const c of cams){
+    if(c.status!=='live'||!c.snapshot_interval_min) continue;
+    if(smallest===null||c.snapshot_interval_min<smallest) smallest=c.snapshot_interval_min;
+  }
+  return Math.min(tick, (smallest===null?1:smallest)*60000);
+}
 function tickCameras(){
   if(!LIVE_ON||!CAMS) return;
-  CAMS.stamp=Math.floor(Date.now()/60000);
+  const now=Date.now();
   for(const c of CAMS.cameras){
     if(c.status!=='live') continue;
     const img=document.getElementById('camimg-'+c.id);
     if(!img) continue;
+    const due=(c.snapshot_interval_min||1)*60000;
+    if(CAM_LAST[c.id]&&now-CAM_LAST[c.id]<due) continue;  // not yet due
+    CAM_LAST[c.id]=now;
+    CAMS.stamp=Math.floor(now/60000);
     camBeginLoad(c.id);
     img.src=camSnapshotSrc(c, CAMS.stamp);
   }
@@ -3226,7 +3261,7 @@ function toggleLive(){
   document.getElementById('cam-toggle-label').textContent =
     LIVE_ON? 'LIVE COVERAGE · παύση':'🔴 LIVE COVERAGE';
   if(CAM_TIMER){ clearInterval(CAM_TIMER); CAM_TIMER=null; }
-  if(LIVE_ON){ tickCameras(); CAM_TIMER=setInterval(tickCameras, (CAMS&&CAMS.refresh_seconds||60)*1000); }
+  if(LIVE_ON){ CAM_LAST={}; tickCameras(); CAM_TIMER=setInterval(tickCameras, refreshTickMs()); }
 }
 
 /* ---------- ERA5 verification ---------- */
@@ -5017,7 +5052,14 @@ async def checkout(request: Request):
     """
     if not bill.checkout_available():
         raise HTTPException(503, "Η πληρωμή δεν είναι διαθέσιμη: " + ", ".join(bill.missing_config()))
-    payload = await request.json()
+    # Same body guard as /api/promo/redeem: a malformed body is a client mistake
+    # and must read as 400, not surface as an unhandled 500.
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
     plan = str(payload.get("plan", "")).strip()
     if plan in ("trial", ""):
         raise HTTPException(400, "Διάλεξε μηνιαίο ή ετήσιο πλάνο.")
@@ -5028,7 +5070,11 @@ async def checkout(request: Request):
     try:
         return bill.create_checkout(plan, customer_email=email, token=token)
     except Exception as e:
-        raise HTTPException(502, f"Stripe: {type(e).__name__}: {str(e)[:160]}")
+        # The exception type/text is dependency detail that must not reach the
+        # client. Keep it server-side for the operator; answer neutrally.
+        log.warning("checkout failed: plan=%s err=%s: %s",
+                    plan, type(e).__name__, str(e)[:200])
+        raise HTTPException(502, "Η πληρωμή δεν ξεκίνησε. Δοκίμασε ξανά σε λίγο.")
 
 
 @app.post("/api/checkout/claim")
@@ -5085,12 +5131,19 @@ async def set_auto_renew(request: Request):
     e = ent.verify_token(token)
     if not e.subscription_id:
         raise HTTPException(404, "Δεν υπάρχει συνδρομή σε αυτό το token.")
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Μη έγκυρο σώμα αιτήματος.")
     enabled = bool(payload.get("enabled"))
     try:
         result = bill.set_auto_renew(e.subscription_id, enabled)
     except Exception as ex:
-        raise HTTPException(502, f"Stripe: {type(ex).__name__}: {str(ex)[:160]}")
+        log.warning("auto-renew change failed: sub=%s enabled=%s err=%s: %s",
+                    e.subscription_id[:12], enabled, type(ex).__name__, str(ex)[:200])
+        raise HTTPException(502, "Η αλλαγή δεν ολοκληρώθηκε. Δοκίμασε ξανά σε λίγο.")
     # The cached state is now wrong by construction; the user just changed it.
     bill.cache_forget(e.subscription_id)
     return result
