@@ -1110,7 +1110,7 @@ button.primary:hover{filter:brightness(1.08)}
       <h2>Γιατί να διαλέξεις το Greece Sky and Weather;</h2>
       <p>Οι κοινές υπηρεσίες δίνουν μία μέση τιμή για ολόκληρη την περιοχή. Εμείς
         υπολογίζουμε την πρόγνωση ειδικά για το σημείο σου — με το πραγματικό του
-        υψόμετρο, με τη σύγκριση τριών μοντέλων και με πλήρη ραδιοβόλιση για την
+        υψόμετρο, με τη σύγκριση μοντέλων και με πλήρη ραδιοβόλιση για την
         πρόγνωση έντονων φαινομένων.</p>
     </div>
 
@@ -1125,7 +1125,7 @@ button.primary:hover{filter:brightness(1.08)}
       </div>
       <div class="fcard">
         <div class="ic">🛰️</div>
-        <h3>Συμφωνία 3 μοντέλων (GFS, ECMWF, ICON)</h3>
+        <h3>Συμφωνία μοντέλων</h3>
         <p>Σύγκριση των κορυφαίων μοντέλων δίπλα-δίπλα. Όταν συμφωνούν, υπάρχει
           ομοφωνία μεταξύ τους· όταν αποκλίνουν, το βλέπεις αμέσως. Είναι ένδειξη
           συμφωνίας, όχι εγγύηση ότι η πρόγνωση θα επαληθευτεί.</p>
@@ -1190,7 +1190,7 @@ button.primary:hover{filter:brightness(1.08)}
 <div class="modal" id="promodal" onclick="if(event.target===this)closeModal()">
   <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="pm-title">
     <h3 id="pm-title">Αναβάθμιση σε PRO</h3>
-    <div class="sub" id="pm-sub">Ξεκλείδωσε πρόγνωση 10 ημερών — δωρεάν οι πρώτες 3 — με Skew-T, δείκτες αστάθειας και σύγκριση 3 μοντέλων.</div>
+    <div class="sub" id="pm-sub">Ξεκλείδωσε πρόγνωση 10 ημερών — δωρεάν οι πρώτες 3 — με Skew-T, δείκτες αστάθειας και σύγκριση μοντέλων.</div>
 
     <div class="plan sel" id="plan-yearly" onclick="pickPlan('yearly')">
       <div class="best">Best Value — Έκπτωση <span id="disc">44.3</span>%</div>
@@ -1389,7 +1389,7 @@ function renderCta(){
   el.innerHTML='<div class="cta">'
     +'<h3>'+(pro?'Το PRO είναι ενεργό':'Και οι υπόλοιπες '+(dayTo-dayFrom+1)+' ημέρες;')+'</h3>'
     +'<p class="lead">'+(pro
-      ? 'Έχεις πλήρη πρόσβαση σε '+PLANS.pro_display+' πρόγνωση, Skew-T, δείκτες αστάθειας και σύγκριση 3 μοντέλων.'
+      ? 'Έχεις πλήρη πρόσβαση σε '+PLANS.pro_display+' πρόγνωση, Skew-T, δείκτες αστάθειας και σύγκριση μοντέλων.'
       : 'Οι ημέρες '+dayFrom+'–'+dayTo+' είναι θολές. Με το PRO βλέπεις ολόκληρη την πρόγνωση.')+'</p>'
     +'<p class="leadsub">Δωρεάν: '+PLANS.free_display+' · PRO: '+PLANS.pro_display
       +' · Κλειδωμένες ώρες: '+locked+'</p>'
@@ -1504,7 +1504,7 @@ function fillPlans(){
     PLANS.unlocks.map(u=>'<li>'+u+'</li>').join('');
   document.getElementById('pm-sub').textContent=
     'Ξεκλείδωσε πρόγνωση '+PLANS.pro_hours/24+' ημερών — δωρεάν οι πρώτες '
-    +PLANS.free_hours/24+' — με Skew-T, δείκτες αστάθειας και σύγκριση 3 μοντέλων.';
+    +PLANS.free_hours/24+' — με Skew-T, δείκτες αστάθειας και σύγκριση μοντέλων.';
   // The modal title must describe what the visitor can actually do here. A PRO
   // visitor opening it from "Διαχείριση συνδρομής" must not be told to upgrade.
   document.getElementById('pm-title').textContent=
@@ -2474,7 +2474,7 @@ function proUpsell(d){
     +'<h4>Οι επόμενες '+locked+' ημέρες είναι διαθέσιμες στο PRO</h4>'
     +'<p>Η δωρεάν πρόγνωση καλύπτει '+free+' ημέρες. Με το PRO ξεκλειδώνεις '
     +(free+locked)+' ημέρες συνολικά ('+((t.pro_hours||PRO_HOURS))+' ώρες), μαζί με '
-    +'Skew-T, δείκτες αστάθειας και σύγκριση 3 μοντέλων.</p>'
+    +'Skew-T, δείκτες αστάθειας και σύγκριση μοντέλων.</p>'
     +'<button class="primary" onclick="openModal()">Αναβάθμιση σε PRO — €'
     +(PLANS?PLANS.pricing.yearly.price.toFixed(2):'19.99')+'/έτος</button>'
     +'</div></div>';
@@ -2705,10 +2705,10 @@ function renderExpert(d){
       lockedBlock('skewt','Η ραδιοβόλιση είναι διαθέσιμη στο PRO',
         'Διάγραμμα Skew-T με καμπύλες θερμοκρασίας και σημείου δρόσου, barb ανέμου ανά '
         +'επίπεδο και αδιαβατικές γραμμές.'));
-    h+=xsec('x-models','Σύγκριση 3 μοντέλων','PRO',
-      lockedBlock('models','Η σύγκριση 3 μοντέλων είναι διαθέσιμη στο PRO',
-        'GFS 0.25°, ICON-EU 7 km και ECMWF IFS δίπλα-δίπλα, με τη μεταξύ τους απόκλιση '
-        +'ως ένδειξη συμφωνίας των μοντέλων.'));
+    h+=xsec('x-models','Σύγκριση μοντέλων','PRO',
+      lockedBlock('models','Η σύγκριση μοντέλων είναι διαθέσιμη στο PRO',
+        'GFS 0.25°, ICON-EU 7 km και ECMWF IFS δίπλα-δίπλα, με την απόκλιση GFS και '
+        +'ICON-EU ως ένδειξη συμφωνίας των μοντέλων.'));
     h+=xsec('x-ens','Σύνολο GEFS','PRO',
       lockedBlock('ens','Το σύνολο GEFS είναι διαθέσιμο στο PRO',
         'Μέσος όρος και διασπορά των 30 διαταραγμένων μελών του GEFS για θερμοκρασία, '
@@ -2844,7 +2844,7 @@ function expertBody(d){
         +'Η διασπορά ανέμου είναι το μέτρο του <b>διανυσματικού</b> σφάλματος, όχι '
         +'διασπορά ταχύτητας.</p>'
         +'<p class="note">Διαφέρει από τη «Συμφωνία μοντέλων»: εκείνη μετρά πόσο '
-        +'απέχουν τρία ντετερμινιστικά μοντέλα μεταξύ τους, εδώ πόσο απέχουν 30 '
+        +'απέχουν τα ντετερμινιστικά μοντέλα μεταξύ τους, εδώ πόσο απέχουν 30 '
         +'διαταραγμένες εκδοχές του ίδιου μοντέλου από τον μέσο όρο τους.</p>';
       h+=xsec('x-ens','Σύνολο GEFS',en.members+' μέλη · μέσος όρος και διασπορά',t);
     }
