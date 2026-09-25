@@ -884,12 +884,18 @@ td.ph{background:linear-gradient(90deg,rgba(255,255,255,.08),rgba(255,255,255,.1
   align-items:center;justify-content:center;overflow:hidden}
 .cam .stage img{width:100%;height:100%;object-fit:cover;display:block}
 .cam .stage .off{color:var(--dim);font-size:12.5px;text-align:center;padding:16px;line-height:1.6}
+.cam .stage .camload{position:absolute;inset:0;display:flex;align-items:center;
+  justify-content:center;color:var(--dim);font-size:12.5px}
 .cam .live{position:absolute;top:9px;left:9px;display:flex;align-items:center;gap:6px;
   background:rgba(17,17,17,.72);color:#fff;font-size:10.5px;font-weight:700;
   letter-spacing:.06em;padding:4px 9px;border-radius:20px;backdrop-filter:blur(4px)}
 .cam .live i{width:7px;height:7px;border-radius:50%;background:#ff3b30;display:block;
   animation:pulse 1.6s ease-in-out infinite}
 .cam .live.off i{background:var(--dim);animation:none}
+/* The LIVE badge starts hidden and is revealed only when a frame actually
+   arrives. `[hidden]` is honoured explicitly because the author `display:flex`
+   above would otherwise beat the user-agent rule and show it anyway. */
+.cam .live[hidden]{display:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
 .cam .meta{padding:13px 15px 15px}
 .cam .meta .nm{font-size:14.5px;font-weight:650;margin:0 0 2px}
@@ -900,6 +906,7 @@ td.ph{background:linear-gradient(90deg,rgba(255,255,255,.08),rgba(255,255,255,.1
 .cam .notebox{font-size:11.5px;color:var(--warn);background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.30);
   border-radius:7px;padding:7px 9px;margin-top:10px;line-height:1.55}
 .cam .cad{font-size:11.5px;color:var(--dim);margin-top:6px}
+.cam .upd{font-size:11.5px;color:var(--dim);margin-top:2px;min-height:14px}
 .cam .stage .golive{position:absolute;bottom:9px;right:9px;background:rgba(17,17,17,.78);color:#fff;
   border:1px solid rgba(255,255,255,.18);font-size:11.5px;font-weight:700;letter-spacing:.04em;
   padding:6px 12px;border-radius:20px;cursor:pointer;backdrop-filter:blur(4px)}
@@ -2975,14 +2982,22 @@ let CAMS=null, LIVE_ON=false, CAM_TIMER=null;
 
 async function loadCameras(){
   const box=document.getElementById('cams');
-  try{
-    const r=await fetch('/api/cameras');
-    CAMS=await r.json();
-  }catch(e){
-    box.innerHTML='<div class="card err">Οι κάμερες δεν φορτώθηκαν.</div>'; return;
+  // One deliberate retry, then stop: a transient blip should not leave the
+  // section dead, but a persistent failure must not become a retry loop.
+  for(let attempt=0; attempt<2; attempt++){
+    try{
+      const r=await fetch('/api/cameras');
+      if(!r.ok) throw new Error('http '+r.status);
+      CAMS=await r.json();
+      track('sky_camera_opened');
+      renderCameras();
+      return;
+    }catch(e){
+      if(attempt===0){ await new Promise(res=>setTimeout(res,1500)); continue; }
+      box.innerHTML='<div class="card err" role="status">'
+        +'Οι κάμερες δεν φόρτωσαν. Δοκίμασε ξανά σε λίγο.</div>';
+    }
   }
-  track('sky_camera_opened');
-  renderCameras();
 }
 function renderCameras(){
   const box=document.getElementById('cams');
@@ -2992,30 +3007,41 @@ function renderCameras(){
   if(CAMS.note!=null) document.getElementById('cam-sub').textContent=CAMS.note;
   box.innerHTML=CAMS.cameras.map(c=>{
     const live=c.status==='live';
-    const src=live? camSnapshotSrc(c, CAMS.stamp) : '';
-    const stage = live
-      ? '<img id="camimg-'+c.id+'" src="'+esc(src)+'" alt="'+esc(c.name)+'" loading="lazy"'
-        +' onerror="snapshotFailed(\''+esc(c.id)+'\')">'
-      : '<div class="off">Δεν έχει συνδεθεί ζωντανή ροή<br><b>'+esc(c.name)+'</b></div>';
-    const badge = live
-      ? '<div class="live"><i></i>LIVE</div>'
-      : '<div class="live off"><i></i>OFFLINE</div>';
-    // The LIVE affordance exists only when the server published a live block:
-    // a supported provider with a valid public id. With no live configured it is
-    // not rendered at all, so there is never a button that opens nothing.
+    let stage, badge;
+    if(live){
+      // The frame starts hidden behind a loading line. It is revealed on load
+      // and swapped for an offline line on error, so the card never shows a
+      // broken-image icon and never claims LIVE for a frame it does not have.
+      stage='<span class="camload">Φόρτωση εικόνας…</span>'
+        +'<img id="camimg-'+esc(c.id)+'" src="'+esc(camSnapshotSrc(c, CAMS.stamp))+'"'
+        +' alt="'+esc(c.name)+' — ζωντανή εικόνα" loading="lazy"'
+        +' onload="snapshotLoaded(\''+esc(c.id)+'\')"'
+        +' onerror="snapshotFailed(\''+esc(c.id)+'\')">';
+      badge='<div class="live" id="cambadge-'+esc(c.id)+'" hidden><i></i>LIVE</div>';
+    }else{
+      stage='<div class="off">Η εικόνα δεν είναι διαθέσιμη<br><b>'+esc(c.name)+'</b></div>';
+      badge='<div class="live off"><i></i>OFFLINE</div>';
+    }
     const golive = (live && c.live)
-      ? '<button class="golive" onclick="openCamLive(\''+esc(c.id)+'\')">🔴 LIVE</button>'
+      ? '<button class="golive" onclick="openCamLive(\''+esc(c.id)+'\')"'
+        +' aria-label="Άνοιγμα ζωντανής ροής: '+esc(c.name)+'">🔴 LIVE</button>'
       : '';
     const tl = c.timelapse
       ? '<a href="'+esc(c.timelapse)+'" target="_blank" rel="noopener"><button>Timelapse</button></a>'
       : '<button disabled title="Δεν έχει ρυθμιστεί timelapse">Timelapse</button>';
+    // Visitor-facing and deliberately uninformative: a missing feed must not
+    // report *why* it is missing, which would expose server configuration.
     const note = live? '' :
-      '<div class="notebox">Η ζωντανή ροή δεν έχει συνδεθεί ακόμη. Όρισε <code>WX_CAMERAS</code> με το snapshot URL.</div>';
+      '<div class="notebox">Η εικόνα αυτής της κάμερας δεν είναι ακόμη διαθέσιμη.</div>';
     const mapq=c.lat!=null&&c.lon!=null? ' onclick="gotoPoint('+c.lat+','+c.lon+',\''+esc(c.name)+'\')"' : '';
     const cadence = live
       ? '<div class="cad">Αυτόματη εικόνα: κάθε '+c.snapshot_interval_min+' '+pluralMin(c.snapshot_interval_min)+'</div>'
       : '';
-    return '<div class="cam" id="camcard-'+esc(c.id)+'">'
+    const upd = live
+      ? '<div class="upd" id="camupd-'+esc(c.id)+'" aria-live="polite"></div>'
+      : '';
+    return '<div class="cam" id="camcard-'+esc(c.id)+'" role="group"'
+      +' aria-label="'+esc(c.name)+'">'
       +'<div class="stage" id="camstage-'+esc(c.id)+'">'+stage+badge+golive+'</div>'
       +'<div class="camplayer" id="camplayer-'+esc(c.id)+'"></div>'
       +'<div class="camctl" id="camctl-'+esc(c.id)+'" hidden></div>'
@@ -3023,10 +3049,47 @@ function renderCameras(){
       +'<div class="rg">'+esc(c.region||'')+(c.lat!=null?' · '+c.lat.toFixed(2)+', '+c.lon.toFixed(2):'')+'</div>'
       +cadence
       +'<div class="actions">'+(c.lat!=null?'<button'+mapq+'>Στην πρόγνωση</button>':'')+tl+'</div>'
-      +note+'</div></div>';
+      +upd+note+'</div></div>';
   }).join('');
 }
 function pluralMin(n){ return n===1? 'λεπτό':'λεπτά'; }
+/* Every state transition goes through these two helpers, so the loading line,
+   the LIVE badge and the timestamp can never disagree about what the card is
+   showing. `camBeginLoad` is used on the first render and on every refresh;
+   `snapshotLoaded` / `snapshotFailed` are the only two ways it resolves. */
+function camBeginLoad(id){
+  const stage=document.getElementById('camstage-'+id);
+  const img=document.getElementById('camimg-'+id);
+  const badge=document.getElementById('cambadge-'+id);
+  if(badge){ badge.hidden=true; badge.classList.remove('off'); } // reset any prior error
+  if(img) img.style.display='';
+  if(stage){
+    const stale=stage.querySelector('.off');
+    if(stale) stale.remove();
+    if(!stage.querySelector('.camload')){
+      const l=document.createElement('span');
+      l.className='camload'; l.textContent='Φόρτωση εικόνας…';
+      stage.insertBefore(l, stage.firstChild);
+    }
+  }
+  camUpdate(id, '');
+}
+function camUpdate(id, text){
+  const el=document.getElementById('camupd-'+id);
+  if(el) el.textContent=text;
+}
+function snapshotLoaded(id){
+  const stage=document.getElementById('camstage-'+id);
+  const load=stage && stage.querySelector('.camload');
+  if(load) load.remove();
+  const badge=document.getElementById('cambadge-'+id);
+  if(badge) badge.hidden=false;
+  camUpdate(id, 'Τελευταία ενημέρωση: '+clockTime());
+}
+function clockTime(){
+  const d=new Date();
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+}
 /* Where a still comes from. Today that is normally the feed's own public URL
    ("direct"), which the browser loads exactly as it always has. A camera whose
    source is private is marked snapshot_via==="server": its URL must never reach
@@ -3040,20 +3103,26 @@ function camSnapshotSrc(c, stamp){
   }
   return c.snapshot+sep+'t='+stamp;
 }
-/* A still that failed to load must not render as a broken icon: the server-side
-   path fails generically (503/504) and the card says so, the same as a feed that
-   is not wired up. Keeps the failure legible instead of looking like an outage. */
+/* A still that failed to load must not render as a broken icon or keep claiming
+   LIVE: the server-side path fails generically (503/504) and the card says so,
+   the same as a feed that is not wired up. The badge goes back to a neutral
+   OFFLINE, so "LIVE" is only ever shown next to a frame that actually arrived. */
 function snapshotFailed(id){
   const c=CAMS&&CAMS.cameras.find(x=>x.id===id);
+  const stage=document.getElementById('camstage-'+id);
   const img=document.getElementById('camimg-'+id);
   if(img) img.style.display='none';
-  const stage=document.getElementById('camstage-'+id);
+  const load=stage && stage.querySelector('.camload');
+  if(load) load.remove();
+  const badge=document.getElementById('cambadge-'+id);
+  if(badge){ badge.classList.add('off'); badge.hidden=false; }
   if(stage && !stage.querySelector('.off')){
     const d=document.createElement('div');
     d.className='off';
     d.innerHTML='Η εικόνα δεν είναι διαθέσιμη<br><b>'+esc((c&&c.name)||'')+'</b>';
     stage.appendChild(d);
   }
+  camUpdate(id, '');
 }
 /* Live playback is a *provider* concern, not a WebRTC one. Today the only
    provider is YouTube, embedded through the official player with the public
@@ -3106,6 +3175,7 @@ function openCamLive(id){
     +'<span class="livehint">Αν δεν ξεκινήσει, πάτησε play στο player.</span>';
   const close=document.createElement('button');
   close.className='closecam'; close.textContent='Κλείσιμο LIVE';
+  close.setAttribute('aria-label','Κλείσιμο ζωντανής ροής: '+c.name);
   close.onclick=()=>closeCamLive(id);
   bar.innerHTML=''; bar.appendChild(state); bar.appendChild(close); bar.hidden=false;
 }
@@ -3120,6 +3190,7 @@ function closeCamLive(id){
   const img=document.getElementById('camimg-'+id);
   if(c&&img){ // refresh to the newest frame rather than the stale one
     CAMS.stamp=Math.floor(Date.now()/60000);
+    camBeginLoad(id);
     img.src=camSnapshotSrc(c, CAMS.stamp);
   }
 }
@@ -3144,6 +3215,7 @@ function tickCameras(){
     if(c.status!=='live') continue;
     const img=document.getElementById('camimg-'+c.id);
     if(!img) continue;
+    camBeginLoad(c.id);
     img.src=camSnapshotSrc(c, CAMS.stamp);
   }
 }
