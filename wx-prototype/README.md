@@ -205,6 +205,34 @@ Endpoints (admin-only, όχι public start/stop ακόμη):
 **Δεν** υπάρχει ακόμη FFmpeg, RTSP dial, YouTube publishing, stream key ή VPS
 αλλαγή. Ο browser δεν έχει — και δεν θα αποκτήσει εδώ — άμεσο control endpoint.
 
+### Real ingest worker (M3-A) — κώδικας έτοιμος, ανενεργός
+
+Ο πραγματικός `StreamWorker` (`WX_STREAM_BACKEND=real`) υπάρχει και είναι
+πλήρως testable χωρίς κάμερα, RTSP URL, credential ή stream key. Δεν ενεργοποιείται
+από μόνο του: με `backend` διάφορο του `mock`/`real` τα starts **απορρίπτονται**
+(fail-closed, ποτέ σιωπηλό fallback στο mock).
+
+* `ingest_process.py` — η **μοναδική** θέση που ξεκινά child process
+  (`asyncio.create_subprocess_exec`, `start_new_session=True`). Το `stderr`
+  διαβάζεται σε bounded buffer· πάντα `DEVNULL` για stdin/stdout.
+* `ingest_command.py` — χτίζει το argv (video-only: `-an` + `-map 0:v:0`, ένα
+  μόνο RTMPS output, καμία εγγραφή). Ο έλεγχος allowlist γίνεται ξανά εδώ, τελευταία
+  στιγμή πριν το `execve`. Summary/exceptions/logs περνούν από `redact_url`·
+  `safe_argv()`/`scrub()` αφαιρούν credential και stream key.
+* `ingest_worker.py` — supervisor ανά κάμερα: heartbeat όσο τρέχει, restart με
+  bounded exponential backoff + jitter, circuit breaker μετά από
+  `MAX_CONSECUTIVE_RESTARTS`, SIGTERM→SIGKILL stop, graceful `shutdown()`.
+* Το child process κληρονομεί **ελάχιστο** environment (`_ENV_PASSTHROUGH`) —
+  ποτέ `WX_ADMIN_TOKEN` ή Stripe keys.
+
+Ο worker γράφει **μόνο** `observed`: το `desired` παραμένει στο control plane, άρα
+ένας worker δεν μπορεί να ξεκινήσει/σταματήσει μόνος του. Ο `start/stop` περνά
+ακόμη αποκλειστικά από admin endpoints.
+
+**Εκκρεμεί για ενεργοποίηση (VPS/deployment, όχι κώδικας):** `WX_CAMERA_INGEST_REF`
++ ένα πραγματικό RTMPS destination, εγκατάσταση FFmpeg, και ενεργό
+`WX_STREAM_ENABLED=1`. Μέχρι τότε ο builder αρνείται κάθε start με `no_output`.
+
 ## Βαθμίδες
 
 Το κλείδωμα εφαρμόζεται **στον server**, όχι με CSS. Στο FREE το `/api/brief`

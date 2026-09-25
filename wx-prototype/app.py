@@ -402,6 +402,16 @@ async def _stop_ram_scheduler():
         _ram_task.cancel()
     if _stream_task is not None and not _stream_task.done():
         _stream_task.cancel()
+    # Stop supervised ingest processes before the loop closes. Only the real
+    # backend owns children; the mock is a no-op, and a deploy that never enabled
+    # streams never builds a worker at all. A stop that fails must not prevent the
+    # rest of shutdown, so it is guarded.
+    try:
+        worker = streams.current_real_worker()
+        if worker is not None:
+            await worker.shutdown()
+    except Exception as e:
+        log.warning("stream worker shutdown failed: type=%s", type(e).__name__)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 

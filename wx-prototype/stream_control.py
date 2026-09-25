@@ -98,7 +98,14 @@ _LIVE_LIKE = ("live",)
 # Closed vocabulary for the admin-facing failure reason. A worker's own message is
 # never stored or shown; it is mapped to one of these.
 ERROR_REASONS = frozenset({"launch_failed", "worker_unavailable", "timeout",
-                           "stale", "unknown"})
+                           "stale", "unknown",
+                           # Refusals the ingest worker maps from a command that
+                           # could not be built. They are here, in the one
+                           # vocabulary, so the admin view never has to render a
+                           # worker's own text.
+                           "source_absent", "credential_missing", "audio_not_allowed",
+                           "no_output", "host_not_allowlisted", "source_scheme",
+                           "not_startable", "backend_unavailable"})
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stream_state (
@@ -185,15 +192,60 @@ class MockStreamWorker(StreamWorker):
             raise StreamWorkerError("worker_unavailable")
 
 
-def worker_for_backend() -> StreamWorker:
-    """The worker the configured backend names. M2 knows only ``mock``.
+# The real backend supervises child processes, so it must be a single object for
+# the whole process: its per-camera job table and mutex are what stop a second
+# request from spawning a second FFmpeg. The mock is stateless and cheap, so it is
+# built per call as before.
+_REAL_WORKER = None
 
-    An unknown or as-yet-unimplemented backend resolves to the mock rather than
-    raising: the control plane must keep working (and keep refusing starts) on a
-    deploy that names a worker this build does not ship.
+
+def worker_for_backend() -> StreamWorker:
+    """The worker the configured backend names. Dispatches on ``WX_STREAM_BACKEND``.
+
+    ``mock`` (the default) returns a stateless :class:`MockStreamWorker`.
+    ``real`` returns the process-wide :class:`RealStreamWorker` singleton, because
+    its per-camera state is the only thing preventing a duplicate process.
+
+    An unknown backend **fails closed**: it returns a worker that refuses every
+    start with a sanitized ``backend_unavailable`` reason. It must never fall back
+    to the mock, because a deploy that asked for real ingest and silently got a
+    fake "live" is the one failure mode this whole layer exists to prevent.
     """
-    mode = (os.environ.get("WX_STREAM_MOCK") or "ok").strip().lower()
-    return MockStreamWorker(mode)
+    global _REAL_WORKER
+    backend = (config.stream_backend() or "mock").strip().lower()
+    if backend == "mock":
+        mode = (os.environ.get("WX_STREAM_MOCK") or "ok").strip().lower()
+        return MockStreamWorker(mode)
+    if backend == "real":
+        if _REAL_WORKER is None:
+            import ingest_worker
+            _REAL_WORKER = ingest_worker.RealStreamWorker()
+        return _REAL_WORKER
+    log.error("unknown stream backend %r; stream starts will be refused", backend)
+    return _UnavailableWorker(backend)
+
+
+def current_real_worker():
+    """The real worker if one has been built this process, else None.
+
+    Used by the app's shutdown hook: it must stop child processes without
+    *creating* a worker, because building one during shutdown would spawn nothing
+    and only add work. Never returns the mock -- a mock has nothing to stop.
+    """
+    return _REAL_WORKER
+
+
+class _UnavailableWorker(StreamWorker):
+    """A backend this build does not ship. Refuses, and never pretends to work."""
+
+    def __init__(self, backend: str) -> None:
+        self.name = f"unavailable:{backend}"[:40]
+
+    async def start(self, camera_id: str) -> str | None:
+        raise StreamWorkerError("backend_unavailable")
+
+    async def stop(self, camera_id: str) -> None:
+        raise StreamWorkerError("backend_unavailable")
 
 
 # ---------------------------------------------------------------- storage
@@ -582,4 +634,50 @@ def reconcile(now: float | None = None) -> list[str]:
             acted.append(row["camera_id"])
     if acted:
         log.warning("stream reconcile: %d stale worker(s) marked errored", len(acted))
+    acted.extend(_drain_disabled())
     return acted
+
+
+def _drain_disabled(now: float | None = None) -> list[str]:
+    """Stop a running camera whose lifecycle is no longer startable (B5).
+
+    ``enabled=false`` on a live camera must mean "stop", not "keep streaming until
+    something else notices". This is the control-plane half: it drives the row to
+    a stopped state and releases the max-active slot, so the public status stops
+    claiming LIVE and the slot is reusable even if the worker's own process is
+    still winding down.
+
+    It deliberately does *not* call the worker. Reconcile stays a pure state
+    narrowing pass with no side effects beyond the database; the worker notices
+    the same lifecycle change on its own (its supervisor refuses to restart a
+    non-startable camera) and unwinds. Two independent checks, one shared rule.
+
+    ``enabled`` keeps its existing meaning -- lifecycle activation, not liveness.
+    """
+    try:
+        import camera_lifecycle as lifecycle
+    except Exception:  # pragma: no cover - import guard
+        return []
+    try:
+        with _connect() as con:
+            rows = con.execute(
+                "SELECT camera_id FROM stream_state WHERE observed IN ('starting','live')"
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+    stopped: list[str] = []
+    for row in rows:
+        cam_id = row["camera_id"]
+        try:
+            ok, _ = lifecycle.is_startable(cam_id)
+        except Exception:
+            # An unanswerable gate must not read as "keep streaming".
+            ok = False
+        if ok:
+            continue
+        _set_observed(cam_id, "stopped")
+        stopped.append(cam_id)
+    if stopped:
+        log.warning("stream reconcile: %d camera(s) stopped after lifecycle change",
+                    len(stopped))
+    return stopped
