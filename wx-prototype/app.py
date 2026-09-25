@@ -1292,8 +1292,8 @@ function esc(s){
    browser decodes `&#39;` back to `'` before the JS parser runs, so an
    apostrophe would end the literal and break — or inject into — the handler.
    Escape for the JS literal first (backslash, quote, control characters, and
-   `<` so no `</script>` can form), then let `esc()` handle the attribute
-   quoting. Always use as `esc(jsq(value))` inside an inline handler. */
+   `<` so no script-closing sequence can form), then let `esc()` handle the
+   attribute quoting. Always use as `esc(jsq(value))` inside an inline handler. */
 function jsq(s){
   return String(s==null?'':s)
     .replace(/\\/g,'\\\\')
